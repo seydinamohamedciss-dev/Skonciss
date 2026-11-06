@@ -1,0 +1,6 @@
+SKONCISS AFRIKA : version installable (PWA)
+
+1. Déposez CE DOSSIER sur un hébergement HTTPS (ex. Netlify : app.netlify.com/drop, ou GitHub Pages).
+2. Ouvrez l'adresse obtenue dans Chrome sur Android.
+3. Menu ⋮ > Installer l'application (ou Ajouter à l'écran d'accueil).
+Les données restent sur le téléphone. Exportez une sauvegarde régulièrement (Menu > Paramètres).
