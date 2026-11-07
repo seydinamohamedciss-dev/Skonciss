@@ -238,11 +238,11 @@ const err = m => { throw new Error(m); };
 let S = null;
 const blank = () => ({
   v: VER, created: nowIso(), lastBackup: null,
-  settings: { company: 'SKONCISS AFRIKA', lateDays: 3, lowDefault: 5, soonDays: 7, debtDays: 7, cc: '221', pin: null, salt: null },
+  settings: { company: 'SKONCISS AFRIKA', lateDays: 3, lowDefault: 5, soonDays: 7, debtDays: 7, cc: '221', phone: '', restockDays: 30, leadDays: 21, inactiveDays: 30, pin: null, salt: null },
   cats: ['Sneakers','Vêtements','Accessoires','Électronique','Maison','Autres'],
   channels: ['TikTok Sneakers','TikTok Vêtements','TikTok Autres Produits','WhatsApp','Vente directe','Autre canal'].map((n,i) => ({ id: 'ch' + (i+1), name: n, active: true })),
-  products: [], moves: [], customers: [], orders: [], sales: [], expenses: [], debts: [], log: [],
-  seq: { order: 0, sale: 0, sku: 0 }
+  products: [], moves: [], customers: [], orders: [], sales: [], expenses: [], debts: [], lots: [], log: [],
+  seq: { order: 0, sale: 0, sku: 0, lot: 0 }
 });
 
 /* ---- journal des modifications importantes ---- */
@@ -694,6 +694,54 @@ async function sha(pin, salt) { const b = await crypto.subtle.digest('SHA-256', 
 
 if (typeof window !== 'undefined') window.SK = { A, debtMetrics, dBalance, dPaid, dAmount, dStatus, debtFor, get S() { return S; }, set S(v) { S = v; }, blank, metrics, range, checkStock, availOf, reservedOf, orderTotal, paidOf, remaining, payStatus, stockValue, receivables, today, F, CSVS };
 
+/* ================= ARRIVAGES (frais d'import répartis par lot) ================= */
+A.lotAlloc = d => {
+  const lines = (d.lines || []).map(l => ({ pid: l.pid, qty: num(l.qty), buy: num(l.buy) })), fees = num(d.transport) + num(d.customs) + num(d.other);
+  const byQty = d.split === 'qty'; let w = lines.map(l => byQty ? l.qty : l.qty * l.buy), sw = sum(w, x => x);
+  if (sw <= 0) { w = lines.map(l => l.qty); sw = sum(w, x => x); }
+  return lines.map((l, i) => { const share = sw ? fees * w[i] / sw : 0, impUnit = l.qty ? Math.round(share / l.qty) : 0; return { ...l, share: Math.round(share), impUnit, cost: l.buy + impUnit }; });
+};
+A.receiveLot = d => {
+  if (!(d.lines || []).length) err('Ajoutez au moins un produit à l\'arrivage.');
+  const seen = new Set();
+  for (const l of d.lines) { const p = prod(l.pid) || err('Produit introuvable.'); if (seen.has(l.pid)) err('Produit en double : ' + p.name + '.'); seen.add(l.pid); if (num(l.qty) < 1) err('Quantité invalide pour ' + p.name + '.'); if (num(l.buy) < 0 || String(l.buy).trim() === '') err('Prix d\'achat manquant pour ' + p.name + '.'); }
+  for (const k of ['transport', 'customs', 'other']) if (num(d[k]) < 0) err('Frais négatifs impossibles.');
+  const date = d.date || today(), alloc = A.lotAlloc(d), no = 'ARR-' + pad(++S.seq.lot, 4), sup = (d.supplier || '').trim();
+  if (S.lots.some(x => Date.now() - x.ts < 15000 && x.lines.map(l => l.pid + 'x' + l.qty).join() === alloc.map(l => l.pid + 'x' + l.qty).join() && x.supplier === sup)) { S.seq.lot--; err('Cet arrivage vient d\'être enregistré.'); }
+  for (const l of alloc) A.moveStock(l.pid, { type: 'entree', qty: l.qty, buy: l.buy, imp: l.impUnit, note: 'Arrivage ' + no + (sup ? ' · ' + sup : '') });
+  const lot = { id: uid('lot'), ts: Date.now(), no, date, supplier: sup, lines: alloc.map(l => ({ pid: l.pid, name: prod(l.pid).name, qty: l.qty, buy: l.buy, impUnit: l.impUnit, share: l.share })),
+    transport: num(d.transport), customs: num(d.customs), other: num(d.other), method: d.method || 'Espèces', split: d.split === 'qty' ? 'qty' : 'value', note: (d.note || '').trim(), recorded: !!d.record };
+  S.lots.push(lot);
+  if (d.record) {
+    const ex = (cat, amount, what) => { if (amount > 0) A.saveExpense('', { date, cat, amount, desc: what + ' ' + no, method: lot.method, inc: true }); };
+    ex('Achat de marchandises', sum(lot.lines, l => l.qty * l.buy), 'Marchandises'); ex('Transport international', lot.transport, 'Transport'); ex('Dédouanement et frais d\'importation', lot.customs, 'Dédouanement'); ex('Autres dépenses', lot.other, 'Autres frais');
+  }
+  L('Arrivage', no, fdl0(lot.lines.length) + ' · frais ' + F(lot.transport + lot.customs + lot.other)); return lot;
+};
+const fdl0 = n => n + ' produit' + (n > 1 ? 's' : '');
+
+/* ================= RÉAPPROVISIONNEMENT ================= */
+function restockList() {
+  const t = today(), from = addDays(t, -30), sold = new Map(), ever = new Map();
+  for (const s of S.sales) if (!s.returned) for (const i of s.items) { ever.set(i.pid, (ever.get(i.pid) || 0) + i.qty); if (s.date.slice(0, 10) >= from) sold.set(i.pid, (sold.get(i.pid) || 0) + i.qty); }
+  const lead = S.settings.leadDays, keep = S.settings.restockDays, out = [];
+  for (const p of S.products) {
+    if (p.archived) continue; const q30 = sold.get(p.id) || 0, perDay = q30 / 30, av = availOf(p), cover = perDay > 0 ? av / perDay : Infinity;
+    if (!(perDay > 0 || (av <= 0 && ever.get(p.id)))) continue;
+    const need = perDay > 0 ? Math.max(0, Math.ceil(perDay * (lead + keep)) - av) : 0;
+    const level = av <= 0 ? 'urgent' : cover < lead ? 'urgent' : cover < lead + keep ? 'soon' : 'ok';
+    if (level === 'ok' && !need) continue; out.push({ p, q30, perDay, av, cover, need, level });
+  }
+  return out.sort((a, b) => a.cover - b.cover);
+}
+
+/* ================= CLIENTS FIDÈLES ================= */
+function crmData() {
+  const t = today();
+  return S.customers.map(c => { const os = custOrders(c).filter(o => o.status === 'Livrée'), total = sum(os, orderTotal), last = os.map(o => o.delivery.deliveredDate || o.date.slice(0, 10)).sort().pop() || '';
+    return { c, n: os.length, total, last, days: last ? Math.floor((Date.parse(t) - Date.parse(last)) / 86400000) : null }; }).filter(x => x.n > 0);
+}
+
 /* ============ Interface ============ */
 const $ = s => document.querySelector(s);
 const ICONS = {
@@ -710,6 +758,7 @@ const ICONS = {
 const I = n => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n].split(' M').map((d, i) => `<path d="${i ? 'M' : ''}${d}"/>`).join('')}</svg>`;
 
 const U = { tab: 'home', sub: null, q: '', cat: '', stockTab: 'all', ordTab: 'all', period: { key: 'month', from: '', to: '' }, sFilter: { ch: '', cat: '', pid: '' }, custQ: '', listFn: null, dTab: 'rec', dPer: 'all', dSt: 'all', dq: '' };
+const EXTRA_SCREENS = {}; let EXTRA_MENU = () => [];
 const fdl = (n, w) => n + ' ' + w + (n > 1 ? 's' : '');
 
 /* ---------- petits composants ---------- */
@@ -765,7 +814,7 @@ function drawNav() {
 function drawMain() {
   const m = $('#main'); U.listFn = null;
   try {
-    const f = U.sub ? { customers: scCustomers, expenses: scExpenses, deliveries: scDeliveries, reports: scReports, channels: scChannels, settings: scSettings, log: scLog, debts: scDebts }[U.sub] : { home: scHome, stock: scStock, orders: scOrders, sales: scSales, menu: scMenu }[U.tab];
+    const f = U.sub ? { customers: scCustomers, expenses: scExpenses, deliveries: scDeliveries, reports: scReports, channels: scChannels, settings: scSettings, log: scLog, debts: scDebts }[U.sub] || EXTRA_SCREENS[U.sub] : { home: scHome, stock: scStock, orders: scOrders, sales: scSales, menu: scMenu }[U.tab];
     m.innerHTML = f();
   } catch (e) { console.error(e); m.innerHTML = empty('Une erreur est survenue', esc(e.message)); }
 }
@@ -823,6 +872,8 @@ function scHome() {
   const dm = debtMetrics();
   if (dm.recLate) alerts.push(`<button class="alert bad" data-act="goDebts" data-tab="rec" data-st="late">${I('clock')}<span>${fdl(dm.recLate, 'créance')} en retard</span>${I('chev')}</button>`);
   if (dm.paySoon || dm.payLate) alerts.push(`<button class="alert warn" data-act="goDebts" data-tab="pay" data-st="all">${I('wallet')}<span>${dm.payLate ? fdl(dm.payLate, 'dette') + ' en retard' : fdl(dm.paySoon, 'dette') + ' à échéance proche'}</span>${I('chev')}</button>`);
+  const rsU = restockList().filter(x => x.level === 'urgent').length;
+  if (rsU) alerts.push(`<button class="alert warn" data-act="sub" data-v="restock">${I('box')}<span>${fdl(rsU, 'produit')} à recommander en urgence</span>${I('chev')}</button>`);
   const cnt = st => S.orders.filter(o => o.status === st).length;
   const warnCost = m.missingCost ? `<div class="note">Estimation incomplète : ${fdl(m.missingCost, 'ligne')} vendue${m.missingCost > 1 ? 's' : ''} sans coût de revient renseigné (le bénéfice est surévalué).</div>` : '';
   return `${periodBar()}
@@ -982,6 +1033,7 @@ function sheetOrder(id) {
     ${o.notes ? `<div class="note"><b>Notes :</b> ${esc(o.notes)}</div>` : ''}
     <div class="btns">
       ${nx ? `<button class="btn p full" data-act="status" data-id="${id}" data-to="${nx[0]}">${nx[1]}</button>` : ''}
+      ${!inactive(o) ? `<button class="btn" data-act="receipt" data-id="${id}">Reçu WhatsApp</button>` : ''}
       ${o.status === 'Retour à traiter' ? `<button class="btn p full" data-act="returnForm" data-id="${id}">Traiter le retour</button>` : ''}
       ${!inactive(o) && remaining(o) > 0 ? `<button class="btn p" data-act="pay" data-id="${id}">Encaisser</button>` : ''}
       ${paid > 0 ? `<button class="btn" data-act="pay" data-id="${id}" data-t="refund">Rembourser</button>` : ''}
@@ -1041,12 +1093,12 @@ function sheetSale(id) {
   openSheet('Vente', () => { const s = S.sales.find(x => x.id === id), o = S.orders.find(x => x.id === s.orderId); return `<div class="row sp"><div><div style="font:800 22px var(--font-d)">${s.no}</div><div class="sub mut">${ft(s.date)} · commande ${s.orderNo}</div></div>${s.returned ? pill('Retournée', 'bad') : pill('Vendue', 'good')}</div>
   <div class="card flat">${s.items.map(i => `<div class="kv"><span>${esc(i.name)} × ${i.qty}<br><small>Prix ${F(i.price)} · coût ${F(i.cost)}${i.cost ? '' : ' (non renseigné)'}</small></span><b>${F(i.qty * i.price)}</b></div>`).join('')}
   ${kv('Réduction', F(s.discount))}${kv('Chiffre d\'affaires', F(s.revenue), 'tot')}${kv('Coût de revient', F(s.cogs))}${kv('Bénéfice brut estimé', F(s.revenue - s.cogs))}${kv('Frais de livraison facturés', F(s.shipFee))}${kv('Frais de livraison payés', F(o ? o.delivery.fee : 0))}${kv('Canal', esc(chName(s.channel)))}${kv('Source', esc(s.source))}${kv('Mode de paiement', esc(o ? ([...new Set(o.payments.filter(p => p.amount > 0 && !p.void).map(p => p.method))].join(', ') || o.mode + ' (non encaissé)') : ''))}${kv('Client', esc(s.customer))}</div>
-  ${o ? `<button class="btn full" data-act="order" data-id="${o.id}">Voir la commande</button>` : ''}`; });
+  ${o ? `<div class="btns"><button class="btn" data-act="order" data-id="${o.id}">Voir la commande</button><button class="btn" data-act="receipt" data-id="${o.id}">Reçu WhatsApp</button></div>` : ''}`; });
 }
 
 /* ============ MENU ET SOUS-PAGES ============ */
 function scMenu() {
-  const rows = [['customers', 'users', 'Clients', S.customers.length + ' enregistré(s)'], ['expenses', 'wallet', 'Dépenses', 'Achats, publicité, emballages…'], ['deliveries', 'truck', 'Livraisons', 'Suivi des expéditions'], ['debts', 'wallet', 'Dettes et créances', recapDebts()], ['reports', 'chart', 'Rapports', 'Bénéfices, créances, exports CSV'], ['channels', 'store', 'Boutiques et canaux', 'TikTok, WhatsApp, vente directe'], ['settings', 'gear', 'Paramètres', 'Sauvegarde, code d\'accès'], ['log', 'clock', 'Historique des modifications', 'Journal des opérations']];
+  const rows = [['customers', 'users', 'Clients', S.customers.length + ' enregistré(s)'], ['expenses', 'wallet', 'Dépenses', 'Achats, publicité, emballages…'], ['deliveries', 'truck', 'Livraisons', 'Suivi des expéditions'], ['debts', 'wallet', 'Dettes et créances', recapDebts()], ['reports', 'chart', 'Rapports', 'Bénéfices, créances, exports CSV'], ['channels', 'store', 'Boutiques et canaux', 'TikTok, WhatsApp, vente directe'], ...EXTRA_MENU(), ['settings', 'gear', 'Paramètres', 'Sauvegarde, code d\'accès'], ['log', 'clock', 'Historique des modifications', 'Journal des opérations']];
   const days = S.lastBackup ? Math.floor((Date.now() - Date.parse(S.lastBackup)) / 86400000) : null;
   const warn = (S.products.length || S.orders.length) && (days === null || days > 7) ? `<button class="alert warn" data-act="sub" data-v="settings">${I('download')}<span>${days === null ? 'Aucune sauvegarde exportée' : 'Dernière sauvegarde il y a ' + days + ' jours'} : exportez-en une</span>${I('chev')}</button>` : '';
   return `${warn}<div class="menu">${rows.map(([k, ic, t, s]) => `<button class="item" data-act="sub" data-v="${k}"><div class="th">${I(ic)}</div><div class="grow"><div class="nm">${t}</div><div class="sub">${s}</div></div>${I('chev')}</button>`).join('')}</div>`;
@@ -1062,7 +1114,7 @@ function scCustomers() { U.listFn = custList; return `<div class="search">${I('s
 function sheetCust(id) {
   openSheet('Client', () => { const c = S.customers.find(x => x.id === id), s = custStats(c), os = custOrders(c).sort((a, b) => b.date.localeCompare(a.date));
     return `<div style="font:800 21px var(--font-d)">${esc(c.name)}</div><div class="card flat">${kv('Téléphone', esc(c.phone || '—'))}${kv('Adresse / zone', esc(c.zone || '—'))}${kv('Première commande', fd(s.first))}${kv('Nombre de commandes', s.n)}${kv('Total des achats', F(s.total))}${kv('Montant restant dû', F(s.due))}</div>
-    <div class="btns"><button class="btn" data-act="editCust" data-id="${id}">Modifier</button><button class="btn p" data-act="newOrderFor" data-id="${id}">Nouvelle commande</button></div>
+    <div class="btns"><button class="btn" data-act="editCust" data-id="${id}">Modifier</button><button class="btn p" data-act="newOrderFor" data-id="${id}">Nouvelle commande</button><button class="btn full" data-act="crmMsg" data-id="${id}">Message WhatsApp</button></div>
     <div class="sec-h"><h2>Historique</h2></div><div class="list">${os.map(ordCard).join('') || '<p class="mut">Aucune commande.</p>'}</div>`; });
 }
 function custForm(id) { openSheet(id ? 'Modifier le client' : 'Nouveau client', () => { const c = id ? S.customers.find(x => x.id === id) : {}; return `<form class="stack" data-form="cust" data-id="${id || ''}">${fld('Nom', 'name', c.name || '', { req: 1 })}${fld('Téléphone', 'phone', c.phone || '', { attrs: 'inputmode="tel"' })}${fld('Adresse ou zone', 'zone', c.zone || '')}<button class="btn p full">Enregistrer</button></form>`; }); }
@@ -1138,7 +1190,7 @@ function scReports() {
   <div class="card"><div class="sec-h"><h2>Retours</h2></div>${kv('Nombre', ret.length)}${kv('Pertes sur retours', F(m.losses))}</div>
   <div class="card stack"><div class="sec-h"><h2>Performance par canal</h2></div>${chan.length ? chan.map(c => `<div class="kv"><span>${esc(c.label)}<br><small>${fdl(c.n, 'commande')} · marge ${F(c.brut)}</small></span><b>${F(c.value)}</b></div>`).join('') : '<p class="mut">Aucune donnée.</p>'}</div>
   <div class="card stack"><div class="sec-h"><h2>Créances clients</h2><small>${F(receivables())}</small></div>${cred.length ? cred.map(o => `<button class="item" data-act="order" data-id="${o.id}"><div class="grow"><b>${o.no} · ${esc(o.name)}</b><div class="sub">${esc(o.phone)}</div></div><div class="amt">${F(remaining(o))}</div></button>`).join('') : '<p class="mut">Aucune créance.</p>'}</div>
-  <div class="card stack"><div class="sec-h"><h2>Exporter</h2><small>CSV pour Excel</small></div><div class="chips" style="flex-wrap:wrap">${exp('produits')}${exp('ventes')}${exp('commandes')}${exp('depenses')}</div><button class="btn s" data-act="copyReport">Copier le résumé (texte)</button></div>`;
+  <div class="card stack"><div class="sec-h"><h2>Exporter</h2><small>CSV pour Excel</small></div><div class="chips" style="flex-wrap:wrap">${exp('produits')}${exp('ventes')}${exp('commandes')}${exp('depenses')}</div><div class="chips" style="flex-wrap:wrap"><button class="btn s" data-act="reportImg">${I('download')} Rapport en image / PDF</button><button class="btn s" data-act="copyReport">Copier le résumé (texte)</button></div></div>`;
 }
 function reportText() { const r = range(U.period), m = metrics(r); return `${S.settings.company}\nRapport ${rangeLabel(r)}\nChiffre d'affaires : ${F(m.ca)}\nCoût des produits vendus : ${F(m.cogs)}\nBénéfice brut : ${F(m.brut)}\nDépenses opérationnelles : ${F(m.opex)}\nLivraison payée : ${F(m.delivPaid)}\nPertes : ${F(m.losses)}\nRésultat estimé : ${F(m.result)}\nEncaissements : ${F(m.cashIn)}\nCréances : ${F(receivables())}\nValeur du stock : ${F(stockValue())}`; }
 
@@ -1147,7 +1199,7 @@ function scSettings() {
   const days = S.lastBackup ? ft(S.lastBackup) : 'jamais';
   return `${installCard()}<div class="card stack"><div class="sec-h"><h2>Sauvegarde et restauration</h2></div><p class="mut">Vos données sont enregistrées sur cet appareil. Dernière sauvegarde exportée : <b>${days}</b>. Exportez régulièrement un fichier de sauvegarde, surtout avant de vider les données du navigateur ou de changer de téléphone.</p>
   <div class="btns"><button class="btn p" data-act="backup">${I('download')} Exporter la sauvegarde</button><label class="btn" style="cursor:pointer">Restaurer<input id="f_restore" type="file" accept=".json,application/json" data-restore="1" hidden></label></div></div>
-  <form class="card stack" data-form="settings"><div class="sec-h"><h2>Entreprise</h2></div>${fld('Nom affiché', 'company', S.settings.company)}<div class="g2">${fld('Commande en retard après (jours)', 'lateDays', S.settings.lateDays, { num: 1 })}${fld('Seuil d\'alerte par défaut', 'lowDefault', S.settings.lowDefault, { num: 1 })}</div><div class="g2">${fld('Échéance par défaut des créances (jours)', 'debtDays', S.settings.debtDays, { num: 1 })}${fld('« Échéance proche » (jours)', 'soonDays', S.settings.soonDays, { num: 1 })}</div>${fld('Indicatif pays pour WhatsApp', 'cc', S.settings.cc, { num: 1, hint: '221 pour le Sénégal' })}<button class="btn p">Enregistrer</button></form>
+  <form class="card stack" data-form="settings"><div class="sec-h"><h2>Entreprise</h2></div>${fld('Nom affiché', 'company', S.settings.company)}<div class="g2">${fld('Commande en retard après (jours)', 'lateDays', S.settings.lateDays, { num: 1 })}${fld('Seuil d\'alerte par défaut', 'lowDefault', S.settings.lowDefault, { num: 1 })}</div><div class="g2">${fld('Échéance par défaut des créances (jours)', 'debtDays', S.settings.debtDays, { num: 1 })}${fld('« Échéance proche » (jours)', 'soonDays', S.settings.soonDays, { num: 1 })}</div>${fld('Indicatif pays pour WhatsApp', 'cc', S.settings.cc, { num: 1, hint: '221 pour le Sénégal' })}${fld('Téléphone de l\'entreprise (reçus et catalogue)', 'phone', S.settings.phone, { attrs: 'inputmode="tel"' })}<div class="g2">${fld('Délai d\'arrivage (jours)', 'leadDays', S.settings.leadDays, { num: 1 })}${fld('Couverture souhaitée (jours)', 'restockDays', S.settings.restockDays, { num: 1 })}</div>${fld('Client inactif après (jours)', 'inactiveDays', S.settings.inactiveDays, { num: 1 })}<button class="btn p">Enregistrer</button></form>
   <div class="card stack"><div class="sec-h"><h2>Code d'accès</h2>${S.settings.pin ? pill('Activé', 'good') : pill('Désactivé')}</div><p class="mut">Un code à 4 chiffres protège l'ouverture de l'application sur cet appareil. Ce n'est pas un compte en ligne : il ne remplace pas la protection du téléphone.</p>
   <div class="btns"><button class="btn" data-act="setPin">${S.settings.pin ? 'Changer le code' : 'Définir un code'}</button>${S.settings.pin ? `<button class="btn d" data-act="rmPin">Retirer le code</button>` : ''}</div></div>
   <div class="card stack"><div class="sec-h"><h2>Contrôle de cohérence</h2></div><p class="mut">Vérifie que le stock correspond aux mouvements et qu'aucune commande n'a deux ventes.</p><button class="btn" data-act="check">Lancer le contrôle</button></div>
@@ -1157,7 +1209,7 @@ function scSettings() {
 }
 async function saveFile(name, text, mime) {
   try { if (window.claude && claude.use) { const dl = await claude.use('downloads'); if (dl) { await dl.save({ filename: name, data: text }); return true; } } } catch (e) { if (e && e.code === 'declined') return false; }
-  try { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: mime })); a.download = name; document.body.appendChild(a); a.click(); a.remove(); return true; } catch (e) { return false; }
+  try { const a = document.createElement('a'); a.href = URL.createObjectURL(text instanceof Blob ? text : new Blob([text], { type: mime })); a.download = name; document.body.appendChild(a); a.click(); a.remove(); return true; } catch (e) { return false; }
 }
 function showText(title, text) { openSheet(title, () => `<p class="mut">Copiez ce texte si le téléchargement n'est pas disponible sur votre appareil.</p><pre class="csv" id="txt">${esc(text.slice(0, 20000))}</pre><button class="btn p full" data-act="copyTxt">Copier</button>`); window.__txt = text; }
 async function copyText(t) { try { await navigator.clipboard.writeText(t); toast('Copié'); } catch (e) { const r = document.createRange(); const n = $('#txt'); if (n) { r.selectNodeContents(n); const s = getSelection(); s.removeAllRanges(); s.addRange(r); toast('Texte sélectionné : copiez-le'); } else toast('Copie impossible', 'err'); } }
@@ -1406,7 +1458,7 @@ const FORMS = {
   paydebt: (f, el) => { try { const x = S.debts.find(y => y.id === el.dataset.id), a = num(f.get('amount')); if (a <= 0) throw new Error('Le montant doit être supérieur à 0.'); if (a > dBalance(x)) throw new Error('Le montant dépasse le solde restant (' + F(dBalance(x)) + ').');
     const d = Object.fromEntries(f.entries()); const rec = x.type === 'receivable';
     ask(rec ? 'Confirmer le paiement ?' : 'Confirmer le remboursement ?', `${F(a)} ${rec ? 'reçus de' : 'remboursés à'} <b>${esc(x.name)}</b> (${esc(d.method)}). Solde après opération : <b>${F(dBalance(x) - a)}</b>.`, 'Confirmer', G(() => { A.payDebt(x.id, d); toast(rec ? 'Paiement enregistré' : 'Remboursement enregistré'); closeSheet(); refresh(); })); } catch (e) { toast(e.message, 'err'); } },
-  settings: G(f => { const lateDays = num(f.get('lateDays')), low = num(f.get('lowDefault')); if (lateDays < 1 || low < 0) throw new Error('Valeurs invalides.'); const dd = num(f.get('debtDays')), sd = num(f.get('soonDays')), cc = digits(f.get('cc')); if (dd < 0 || sd < 0 || !cc) throw new Error('Valeurs invalides.'); Object.assign(S.settings, { company: (f.get('company') || '').trim() || 'SKONCISS AFRIKA', lateDays, lowDefault: low, debtDays: dd, soonDays: sd, cc }); L('Paramètres modifiés'); toast('Paramètres enregistrés'); refresh(); }),
+  settings: G(f => { const lateDays = num(f.get('lateDays')), low = num(f.get('lowDefault')); if (lateDays < 1 || low < 0) throw new Error('Valeurs invalides.'); const dd = num(f.get('debtDays')), sd = num(f.get('soonDays')), cc = digits(f.get('cc')); if (dd < 0 || sd < 0 || !cc) throw new Error('Valeurs invalides.'); Object.assign(S.settings, { company: (f.get('company') || '').trim() || 'SKONCISS AFRIKA', lateDays, lowDefault: low, debtDays: dd, soonDays: sd, cc, phone: (f.get('phone') || '').trim(), leadDays: Math.max(0, num(f.get('leadDays'))), restockDays: Math.max(1, num(f.get('restockDays'))), inactiveDays: Math.max(1, num(f.get('inactiveDays'))) }); L('Paramètres modifiés'); toast('Paramètres enregistrés'); refresh(); }),
   pin: async f => { try { const pin = f.get('pin'); if (!/^\d{4}$/.test(pin)) throw new Error('Le code doit contenir 4 chiffres.'); const salt = uid('s'); S.settings.salt = salt; S.settings.pin = await sha(pin, salt); L('Code d\'accès défini'); toast('Code enregistré'); closeSheet(); refresh(); } catch (e) { toast(e.message, 'err'); } },
   unlock: async (f) => { const p = f.get('pin'); const ok = (await sha(p, S.settings.salt)) === S.settings.pin; if (ok) { $('#lock').classList.remove('on'); $('#lock').innerHTML = ''; } else { $('#lerr').textContent = 'Code incorrect'; $('#pin').value = ''; } },
   dlg: () => {}
@@ -1423,5 +1475,219 @@ async function boot() {
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
 }
 boot();
+
+/* ============ Reçus, arrivages, réapprovisionnement, catalogue, clients fidèles, rapport image/PDF ============ */
+Object.assign(SUBT, { lots: 'Arrivages', restock: 'À recommander', catalog: 'Catalogue à partager', crm: 'Clients fidèles' });
+EXTRA_MENU = () => {
+  const rs = restockList().filter(x => x.level !== 'ok').length;
+  return [['lots', 'box', 'Arrivages', 'Frais d\'import répartis par lot'], ['restock', 'clock', 'À recommander', rs ? rs + ' produit(s) à réapprovisionner' : 'Selon vos ventes'], ['catalog', 'store', 'Catalogue à partager', 'Texte ou image pour WhatsApp'], ['crm', 'users', 'Clients fidèles', 'Meilleurs clients et relances']];
+};
+
+/* ---------- dessin (canvas) ---------- */
+const loadImg = src => new Promise(res => { if (!src) return res(null); const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
+const GOLD = '#D4A62A', BLACK = '#0D0D0D', INK = '#111111', MUT = '#5E5B52', LINE = '#DDDAD0';
+const FONT = (w, s) => `${w} ${s}px Figtree, "Segoe UI", Roboto, system-ui, sans-serif`;
+function mkCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d'); x.fillStyle = '#FFFFFF'; x.fillRect(0, 0, w, h); x.textBaseline = 'alphabetic'; return [c, x]; }
+function fit(x, text, max) { let t = String(text); if (x.measureText(t).width <= max) return t; while (t.length > 1 && x.measureText(t + '…').width > max) t = t.slice(0, -1); return t + '…'; }
+function rrect(x, a, b, w, h, r) { x.beginPath(); x.moveTo(a + r, b); x.arcTo(a + w, b, a + w, b + h, r); x.arcTo(a + w, b + h, a, b + h, r); x.arcTo(a, b + h, a, b, r); x.arcTo(a, b, a + w, b, r); x.closePath(); }
+async function header(x, W, title, sub, sub2) {
+  x.fillStyle = BLACK; x.fillRect(0, 0, W, 220); const lg = await loadImg(LOGO_LG); if (lg) x.drawImage(lg, 40, 35, 150, 150);
+  x.fillStyle = GOLD; x.font = FONT(800, 34); x.fillText(S.settings.company, 215, 92);
+  x.fillStyle = '#F5E7B8'; x.font = FONT(700, 26); x.fillText(title, 215, 136); x.font = FONT(500, 22); x.fillStyle = '#B59A4A'; x.fillText(sub || '', 215, 170); if (sub2) x.fillText(sub2, 215, 198);
+}
+function footer(x, W, y, msg) {
+  x.fillStyle = BLACK; x.fillRect(0, y, W, 130); x.fillStyle = GOLD; x.font = FONT(700, 26); x.textAlign = 'center'; x.fillText(msg, W / 2, y + 52);
+  x.fillStyle = '#B59A4A'; x.font = FONT(500, 20); x.fillText(S.settings.phone ? 'WhatsApp : ' + S.settings.phone : 'Gérer aujourd\'hui, bâtir demain', W / 2, y + 90); x.textAlign = 'left';
+}
+async function receiptCanvas(o) {
+  const W = 720, P = 44, tot = [['Sous-total', F(itemsTotal(o))]]; if (o.discount) tot.push(['Réduction', '− ' + F(o.discount)]); if (o.shipFee) tot.push(['Livraison', F(o.shipFee)]);
+  tot.push(['TOTAL', F(orderTotal(o)), 1]); tot.push(['Payé', F(paidOf(o))]); tot.push(['Reste à payer', F(remaining(o)), 2]);
+  const H = 220 + 150 + o.items.length * 78 + 30 + tot.length * 50 + 100 + 130; const [c, x] = mkCanvas(W, H);
+  await header(x, W, 'REÇU ' + o.no, ft(o.date), '');
+  let y = 270; x.fillStyle = MUT; x.font = FONT(600, 20); x.fillText('CLIENT', P, y); x.fillStyle = INK; x.font = FONT(700, 28); x.fillText(fit(x, o.name, W - 2 * P), P, y + 36);
+  if (o.phone || o.zone) { x.fillStyle = MUT; x.font = FONT(500, 22); x.fillText(fit(x, [o.phone, o.zone].filter(Boolean).join(' · '), W - 2 * P), P, y + 68); }
+  y = 380; x.strokeStyle = LINE; x.lineWidth = 2; x.beginPath(); x.moveTo(P, y); x.lineTo(W - P, y); x.stroke(); y += 20;
+  for (const i of o.items) { x.fillStyle = INK; x.font = FONT(700, 25); x.fillText(fit(x, i.name, W - 2 * P - 190), P, y + 30); x.textAlign = 'right'; x.fillText(F(i.qty * i.price), W - P, y + 30); x.textAlign = 'left'; x.fillStyle = MUT; x.font = FONT(500, 21); x.fillText(i.qty + ' × ' + F(i.price), P, y + 58); y += 78; }
+  y += 10; x.beginPath(); x.moveTo(P, y); x.lineTo(W - P, y); x.stroke(); y += 16;
+  for (const [a, b, k] of tot) { x.fillStyle = k === 2 && remaining(o) > 0 ? '#B3321F' : INK; x.font = FONT(k ? 800 : 500, k ? 30 : 25); x.fillText(a, P, y + 32); x.textAlign = 'right'; x.fillText(b, W - P, y + 32); x.textAlign = 'left'; y += 50; }
+  const ps = inactive(o) ? o.status : payStatus(o); x.font = FONT(700, 22); const tw = x.measureText(ps).width + 36; x.fillStyle = ps === 'Payé' ? '#DDF2E4' : '#FBEACB'; rrect(x, P, y + 12, tw, 42, 21); x.fill(); x.fillStyle = ps === 'Payé' ? '#17803F' : '#8F5600'; x.fillText(ps, P + 18, y + 41);
+  footer(x, W, H - 130, 'Merci pour votre confiance !'); return c;
+}
+function receiptText(o) {
+  const L = [`*${S.settings.company}*`, `Reçu ${o.no} · ${fd(o.date.slice(0, 10))}`, `Client : ${o.name}`, ''];
+  o.items.forEach(i => L.push(`• ${i.name} × ${i.qty} : ${F(i.qty * i.price)}`)); L.push('');
+  if (o.discount) L.push('Réduction : − ' + F(o.discount)); if (o.shipFee) L.push('Livraison : ' + F(o.shipFee));
+  L.push(`*Total : ${F(orderTotal(o))}*`, `Payé : ${F(paidOf(o))}`, `Reste à payer : ${F(remaining(o))}`, '', 'Merci pour votre confiance !'); if (S.settings.phone) L.push('WhatsApp : ' + S.settings.phone);
+  return L.join('\n');
+}
+async function reportCanvas(r) {
+  const m = metrics(r), W = 720, P = 44, rows = [['Chiffre d\'affaires (produits)', F(m.ca)], ['Coût des produits vendus', '− ' + F(m.cogs)], ['Bénéfice brut', F(m.brut), 1], ['Livraison facturée aux clients', F(m.shipBilled)], ['Dépenses opérationnelles', '− ' + F(m.opex)], ['Livraison payée', '− ' + F(m.delivPaid)], ['Pertes (retours)', '− ' + F(m.losses)], ['Résultat estimé', F(m.result), 1]];
+  const extra = [['Encaissements de la période', F(m.cashIn)], ['Créances clients (à recevoir)', F(receivables())], ['Valeur du stock (au coût)', F(stockValue())], ['Achats de stock (hors résultat)', F(m.purchases)]];
+  const tp = topProducts(m.sales, 5), H = 220 + 60 + rows.length * 54 + 40 + extra.length * 44 + 70 + (tp.length ? 60 + tp.length * 44 : 0) + 130 + 40; const [c, x] = mkCanvas(W, H);
+  await header(x, W, 'RAPPORT D\'ACTIVITÉ', rangeLabel(r), 'Généré le ' + fd(today()));
+  let y = 250; for (const [a, b, k] of rows) { if (k) { x.fillStyle = '#F6E9BE'; x.fillRect(P - 12, y, W - 2 * P + 24, 52); } x.fillStyle = INK; x.font = FONT(k ? 800 : 500, k ? 28 : 24); x.fillText(a, P, y + 35); x.textAlign = 'right'; x.fillText(b, W - P, y + 35); x.textAlign = 'left'; y += 54; }
+  y += 24; x.fillStyle = MUT; x.font = FONT(700, 20); x.fillText('SITUATION', P, y); y += 14; for (const [a, b] of extra) { x.fillStyle = INK; x.font = FONT(500, 23); x.fillText(a, P, y + 30); x.font = FONT(700, 23); x.textAlign = 'right'; x.fillText(b, W - P, y + 30); x.textAlign = 'left'; y += 44; }
+  if (tp.length) { y += 30; x.fillStyle = MUT; x.font = FONT(700, 20); x.fillText('PRODUITS LES PLUS VENDUS', P, y); y += 14; for (const t of tp) { x.fillStyle = INK; x.font = FONT(500, 23); x.fillText(fit(x, t.label, 420), P, y + 30); x.font = FONT(700, 23); x.textAlign = 'right'; x.fillText(t.value + ' u. · ' + F(t.ca), W - P, y + 30); x.textAlign = 'left'; y += 44; } }
+  footer(x, W, H - 130, 'Estimations basées sur les données enregistrées'); return c;
+}
+const catPages = async (ids) => {
+  const prods = ids.map(prod).filter(Boolean), per = 8, pages = [], W = 720, CW = 316, CH = 360, G = 24;
+  for (let pg = 0; pg * per < prods.length; pg++) {
+    const chunk = prods.slice(pg * per, pg * per + per), rows = Math.ceil(chunk.length / 2), H = 220 + 30 + rows * (CH + G) + 130 + 10; const [c, x] = mkCanvas(W, H);
+    await header(x, W, 'CATALOGUE', fd(today()) + (prods.length > per ? ' · page ' + (pg + 1) + '/' + Math.ceil(prods.length / per) : ''), '');
+    for (let i = 0; i < chunk.length; i++) {
+      const p = chunk[i], cx = 40 + (i % 2) * (CW + G), cy = 250 + Math.floor(i / 2) * (CH + G);
+      x.fillStyle = '#FFFFFF'; rrect(x, cx, cy, CW, CH, 18); x.fill(); x.strokeStyle = LINE; x.lineWidth = 2; x.stroke();
+      x.save(); rrect(x, cx + 1, cy + 1, CW - 2, 230, 17); x.clip(); x.fillStyle = '#F6E9BE'; x.fillRect(cx, cy, CW, 232);
+      const im = await loadImg(p.photo); if (im) { const k = Math.max(CW / im.width, 232 / im.height), w = im.width * k, h = im.height * k; x.drawImage(im, cx + (CW - w) / 2, cy + (232 - h) / 2, w, h); } else { x.fillStyle = '#7A5A00'; x.font = FONT(800, 90); x.textAlign = 'center'; x.fillText(p.name.charAt(0).toUpperCase(), cx + CW / 2, cy + 148); x.textAlign = 'left'; }
+      x.restore();
+      x.fillStyle = INK; x.font = FONT(700, 23); x.fillText(fit(x, p.name, CW - 28), cx + 14, cy + 270); x.fillStyle = '#7A5A00'; x.font = FONT(800, 28); x.fillText(F(p.price), cx + 14, cy + 308);
+      const a = availOf(p); x.font = FONT(600, 19); x.fillStyle = a <= p.alert ? '#B3321F' : '#17803F'; x.fillText(a <= p.alert ? 'Dernières pièces : ' + a : 'Disponible', cx + 14, cy + 340);
+    }
+    footer(x, W, H - 130, 'Commandez sur WhatsApp'); pages.push(c);
+  }
+  return pages;
+};
+function catalogText(ids) {
+  const L = [`*${S.settings.company}* · Catalogue du ${fd(today())}`, ''];
+  ids.map(prod).filter(Boolean).forEach(p => { const a = availOf(p); L.push(`• ${p.name} : ${F(p.price)}${a <= p.alert ? ' (dernières pièces : ' + a + ')' : ''}`); });
+  L.push('', 'Pour commander, répondez à ce message' + (S.settings.phone ? ' ou écrivez au ' + S.settings.phone : '') + '.'); return L.join('\n');
+}
+function pdfFromCanvas(c) {
+  const bin = atob(c.toDataURL('image/jpeg', .92).split(',')[1]), img = Uint8Array.from(bin, ch => ch.charCodeAt(0)), w = 595, h = Math.round(595 * c.height / c.width), enc = new TextEncoder(), parts = [], off = []; let len = 0;
+  const push = b => { const u = typeof b === 'string' ? enc.encode(b) : b; parts.push(u); len += u.length; }, obj = (n, body) => { off[n] = len; push(n + ' 0 obj\n' + body + '\nendobj\n'); };
+  push('%PDF-1.4\n'); obj(1, '<< /Type /Catalog /Pages 2 0 R >>'); obj(2, '<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+  obj(3, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>`);
+  off[4] = len; push(`4 0 obj\n<< /Type /XObject /Subtype /Image /Width ${c.width} /Height ${c.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${img.length} >>\nstream\n`); push(img); push('\nendstream\nendobj\n');
+  const cs = `q ${w} 0 0 ${h} 0 0 cm /Im0 Do Q`; obj(5, `<< /Length ${cs.length} >>\nstream\n${cs}\nendstream`);
+  const xr = len; push('xref\n0 6\n0000000000 65535 f \n'); for (let i = 1; i <= 5; i++) push(String(off[i]).padStart(10, '0') + ' 00000 n \n'); push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xr}\n%%EOF`);
+  return new Blob(parts, { type: 'application/pdf' });
+}
+const toBlob = c => new Promise(r => c.toBlob(r, 'image/png'));
+async function deliver(blob, name, mime, text) {
+  try { const f = new File([blob], name, { type: mime }); if (navigator.canShare && navigator.canShare({ files: [f] })) { await navigator.share({ files: [f], text: text || '' }); return 'partagé'; } } catch (e) { if (e && e.name === 'AbortError') return 'annulé'; }
+  return (await saveFile(name, blob, mime)) ? 'enregistré' : 'échec';
+}
+let IMGS = [];
+async function imgSheet(title, canvases, base, text, withPdf) {
+  IMGS = canvases; const urls = canvases.map(c => c.toDataURL('image/png'));
+  openSheet(title, () => `<div class="note">« Partager » ouvre la liste de vos applications (WhatsApp…). Si votre téléphone ne le permet pas, le fichier est enregistré, ou appuyez longuement sur l'image pour l'enregistrer.</div>
+    ${urls.map((u, i) => `<div class="card flat stack"><img src="${u}" alt="Aperçu ${i + 1}" style="border-radius:10px;border:1px solid var(--line)"><div class="btns"><button class="btn p" data-act="imgGo" data-i="${i}" data-base="${esc(base)}">Partager / enregistrer l'image</button>${withPdf ? `<button class="btn" data-act="pdfGo" data-i="${i}" data-base="${esc(base)}">Enregistrer en PDF</button>` : ''}</div></div>`).join('')}`);
+  window.__imgText = text || '';
+}
+
+/* ---------- reçu ---------- */
+function receiptSheet(oid) {
+  const o = ord(oid); window.__txt = receiptText(o);
+  openSheet('Reçu ' + o.no, () => `<div class="note">Rien n'est envoyé automatiquement : WhatsApp s'ouvre avec le texte, vous appuyez sur « Envoyer ».</div>
+    <label class="f"><span>Reçu en texte (modifiable)</span><textarea id="rc_text" data-mm="rc" data-phone="${esc(o.phone)}" style="min-height:230px">${esc(window.__txt)}</textarea></label>
+    <div class="btns">${waNum(o.phone) ? `<a class="btn p" id="mm_go" href="${waLink(o.phone, window.__txt)}" target="_blank" rel="noopener">Envoyer par WhatsApp</a>` : `<a class="btn p" id="mm_go" href="${waLink('', window.__txt).replace('wa.me/', 'wa.me/')}" target="_blank" rel="noopener">Choisir le contact WhatsApp</a>`}<button class="btn" data-act="copyTxt">Copier le texte</button><button class="btn full" data-act="receiptImg" data-id="${oid}">Créer le reçu en image (avec logo)</button></div>`);
+}
+/* ---------- message générique ---------- */
+function msgSheet(title, phone, text, info) {
+  window.__txt = text;
+  openSheet(title, () => `${info ? `<div class="card flat">${info}</div>` : ''}<div class="note">Rien n'est envoyé automatiquement : WhatsApp s'ouvre avec le texte, vous appuyez sur « Envoyer ».</div>
+    <label class="f"><span>Message (modifiable)</span><textarea id="mm_text" data-mm="mm" data-phone="${esc(phone || '')}" style="min-height:200px">${esc(window.__txt)}</textarea></label>
+    <div class="btns"><a class="btn p" id="mm_go" href="${waNum(phone) ? waLink(phone, window.__txt) : 'https://wa.me/?text=' + encodeURIComponent(window.__txt)}" target="_blank" rel="noopener">${waNum(phone) ? 'Ouvrir WhatsApp' : 'Choisir le contact WhatsApp'}</a><button class="btn" data-act="copyTxt">Copier le message</button></div>`);
+}
+
+/* ---------- arrivages ---------- */
+let LD = null;
+function newLot(prefill) { LD = { supplier: '', date: today(), lines: prefill || [], transport: '', customs: '', other: '', method: 'Espèces', split: 'value', record: true, note: '', pq: '' }; }
+function lotPreview() {
+  const al = A.lotAlloc(LD), fees = num(LD.transport) + num(LD.customs) + num(LD.other), goods = sum(al, l => l.qty * l.buy);
+  return (al.length ? al.map(l => { const p = prod(l.pid); return `<div class="kv"><span>${esc(p ? p.name : '?')}<br><small>${l.qty} × ${F(l.buy)} + frais ${F(l.impUnit)}/unité</small></span><b>${F(l.cost)}<br><small style="font-weight:500">coût de revient / unité</small></b></div>`; }).join('') : '<p class="mut">Ajoutez des produits.</p>') +
+    kv('Marchandises', F(goods)) + kv('Frais d\'import à répartir', F(fees)) + kv('Total de l\'arrivage', F(goods + fees), 'tot');
+}
+function lotForm() {
+  const opts = S.products.filter(p => !p.archived && (!LD.pq || (p.name + ' ' + p.sku).toLowerCase().includes(LD.pq.toLowerCase())) && !LD.lines.some(l => l.pid === p.id));
+  return `<form class="stack" data-form="lot">
+  <div class="g2">${fld('Fournisseur', 'supplier', LD.supplier, { attrs: 'data-ld="supplier"' })}${fld('Date de réception', 'date', LD.date, { type: 'date', req: 1, attrs: 'data-ld="date"' })}</div>
+  <div class="sec-h"><h2>Produits reçus</h2></div>
+  <div class="card flat">${LD.lines.length ? LD.lines.map((l, ix) => { const p = prod(l.pid); return `<div class="line"><div class="lh">${esc(p ? p.name : '?')}</div><button type="button" class="x" data-act="lotRm" data-i="${ix}" aria-label="Retirer">${I('x')}</button><div class="g2"><label class="f"><span>Quantité reçue</span><input id="ll_q${ix}" inputmode="numeric" value="${esc(l.qty)}" data-ll="${ix}:qty"></label><label class="f"><span>Prix d'achat unitaire</span><input id="ll_b${ix}" inputmode="numeric" value="${esc(l.buy)}" data-ll="${ix}:buy"></label></div></div>`; }).join('') : '<p class="mut">Aucun produit ajouté.</p>'}</div>
+  <div class="stack"><div class="search">${I('search')}<input id="lq" type="search" placeholder="Filtrer les produits" value="${esc(LD.pq)}" data-ld="pq" data-redraw="1"></div>
+  <div class="row"><select id="lpick" class="grow" style="min-height:48px;border-radius:12px;border:1px solid var(--line);background:var(--card);padding:0 10px" aria-label="Produit">${opts.length ? opts.map(p => `<option value="${p.id}">${esc(p.name)} · stock ${p.qty}</option>`).join('') : '<option value="">Aucun produit disponible</option>'}</select><button type="button" class="btn p" data-act="lotAdd">Ajouter</button></div></div>
+  <div class="sec-h"><h2>Frais d'importation du lot</h2></div>
+  <div class="g2">${fld('Transport international', 'transport', LD.transport, { num: 1, attrs: 'data-ld="transport"' })}${fld('Dédouanement', 'customs', LD.customs, { num: 1, attrs: 'data-ld="customs"' })}</div>
+  ${fld('Autres frais (transitaire, manutention…)', 'other', LD.other, { num: 1, attrs: 'data-ld="other"' })}
+  ${sel('Répartir les frais selon', 'split', [['value', 'La valeur d\'achat de chaque produit'], ['qty', 'Le nombre d\'unités']], LD.split, { attrs: 'data-ld="split"' })}
+  <div class="card flat" id="lp">${lotPreview()}</div>
+  ${sel('Moyen de paiement', 'method', METHODS, LD.method, { attrs: 'data-ld="method"' })}
+  <label class="row" style="gap:10px"><input type="checkbox" id="f_record" data-ld="record" style="width:22px;height:22px" ${LD.record ? 'checked' : ''}><span>Enregistrer aussi les dépenses (marchandises, transport, dédouanement). Elles ne sont pas déduites une 2e fois du résultat.</span></label>
+  ${area('Note', 'note', LD.note, { attrs: 'data-ld="note"' })}
+  <div class="note">À la validation : le stock augmente et le coût de revient de chaque produit est recalculé en moyenne pondérée avec le stock déjà présent.</div>
+  <button class="btn p full">Valider l'arrivage</button></form>`;
+}
+EXTRA_SCREENS.lots = () => {
+  const L = S.lots.slice().sort((a, b) => b.date.localeCompare(a.date) || b.ts - a.ts);
+  return `<div class="note">Un arrivage répartit automatiquement les frais de transport et de dédouanement sur chaque produit pour obtenir le vrai coût de revient.</div>
+  <div class="list">${L.length ? L.map(l => `<button class="item" data-act="lot" data-id="${l.id}"><div class="th">${I('box')}</div><div class="grow"><div class="nm">${l.no}${l.supplier ? ' · ' + esc(l.supplier) : ''}</div><div class="sub">${fd(l.date)} · ${fdl(l.lines.length, 'produit')} · ${sum(l.lines, x => x.qty)} unités</div></div><div class="amt">${F(l.transport + l.customs + l.other)}<small>frais d'import</small></div></button>`).join('') : empty('Aucun arrivage', 'Enregistrez votre premier arrivage pour répartir les frais d\'import.', `<button class="btn p" data-act="newLot">${I('plus')} Nouvel arrivage</button>`)}</div>
+  <button class="fab" data-act="newLot">${I('plus')} Arrivage</button>`;
+};
+/* ---------- à recommander ---------- */
+EXTRA_SCREENS.restock = () => {
+  const R = restockList();
+  return `<div class="note">Calcul basé sur vos ventes des 30 derniers jours, un délai d'arrivage de <b>${S.settings.leadDays} jours</b> et une couverture souhaitée de <b>${S.settings.restockDays} jours</b> après l'arrivée (modifiable dans Paramètres).</div>
+  ${R.length ? `<div class="list">${R.map(r => `<div class="item" style="cursor:default">${thumb(r.p)}<div class="grow"><div class="row sp wrapx"><div class="nm">${esc(r.p.name)}</div>${r.level === 'urgent' ? pill('Urgent', 'bad') : r.level === 'soon' ? pill('Bientôt', 'warn') : pill('À prévoir')}</div><div class="sub">${r.q30} vendu(s) en 30 j · ${r.av} dispo${isFinite(r.cover) ? ' · ≈ ' + Math.floor(r.cover) + ' j de stock' : ''}</div></div><div class="amt">${r.need}<small>à commander</small></div></div>`).join('')}</div>
+  <div class="btns"><button class="btn p" data-act="restockLot">Créer un arrivage avec ces produits</button><button class="btn" data-act="restockCopy">Copier la liste</button></div>` : empty('Rien à recommander', 'Aucun produit ne risque la rupture au rythme actuel de vos ventes, ou il n\'y a pas encore assez de ventes pour estimer.')}`;
+};
+/* ---------- catalogue ---------- */
+let CATSEL = null;
+EXTRA_SCREENS.catalog = () => {
+  const all = S.products.filter(p => !p.archived && availOf(p) > 0); if (!CATSEL) CATSEL = new Set(all.map(p => p.id)); [...CATSEL].forEach(id => { if (!all.some(p => p.id === id)) CATSEL.delete(id); });
+  return `<div class="note">Choisissez les produits à présenter. Seuls les produits en stock sont proposés.</div>
+  ${all.length ? `<div class="row"><button class="chip" data-act="catAll" data-v="1">Tout cocher</button><button class="chip" data-act="catAll" data-v="0">Tout décocher</button></div>
+  <div class="list">${all.map(p => `<label class="item" style="cursor:pointer"><input type="checkbox" data-cat="${p.id}" style="width:22px;height:22px" ${CATSEL.has(p.id) ? 'checked' : ''}>${thumb(p)}<div class="grow"><div class="nm">${esc(p.name)}</div><div class="sub">${F(p.price)} · ${availOf(p)} dispo</div></div></label>`).join('')}</div>
+  <div class="btns"><button class="btn p" data-act="catText">Message texte WhatsApp</button><button class="btn" data-act="catImg">Image du catalogue</button></div>` : empty('Aucun produit en stock', 'Ajoutez des produits avec du stock pour créer un catalogue.')}`;
+};
+/* ---------- clients fidèles ---------- */
+let CRMTAB = 'best';
+EXTRA_SCREENS.crm = () => {
+  const D0 = crmData(), inact = S.settings.inactiveDays, best = D0.slice().sort((a, b) => b.total - a.total).slice(0, 15), idle = D0.filter(x => x.days >= inact).sort((a, b) => b.total - a.total);
+  const L = CRMTAB === 'best' ? best : idle, chip = (v, l) => `<button class="chip ${CRMTAB === v ? 'on' : ''}" data-act="crmTab" data-v="${v}">${l}</button>`;
+  return `<div class="chips">${chip('best', 'Meilleurs clients (' + best.length + ')')}${chip('idle', 'Inactifs depuis ' + inact + ' j (' + idle.length + ')')}</div>
+  <div class="note">Basé sur les commandes livrées. Touchez un client pour préparer un message WhatsApp (envoyé uniquement quand vous appuyez sur « Envoyer »).</div>
+  <div class="list">${L.length ? L.map(x => `<button class="item" data-act="crmMsg" data-id="${x.c.id}"><div class="th">${esc(x.c.name.charAt(0).toUpperCase())}</div><div class="grow"><div class="nm">${esc(x.c.name)}</div><div class="sub">${fdl(x.n, 'commande')} · dernière il y a ${x.days} j</div></div><div class="amt">${F(x.total)}<small>achats</small></div></button>`).join('') : empty(CRMTAB === 'best' ? 'Aucun client pour le moment' : 'Aucun client inactif', 'Les clients apparaissent ici après leur première commande livrée.')}</div>`;
+};
+function crmMessage(c, kind) {
+  const first = c.name.trim().split(/\s+/)[0];
+  return kind === 'idle' ? `Bonjour ${first},\n\nÇa fait un moment ! Chez ${S.settings.company}, de nouveaux arrivages viennent d'arriver. Voulez-vous que je vous envoie le catalogue ?\n\nMerci pour votre confiance.\n${S.settings.company}`
+    : `Bonjour ${first},\n\nMerci pour votre fidélité à ${S.settings.company} ! Nous avons de nouveaux produits et je serais ravi de vous les présenter en premier. Souhaitez-vous voir le catalogue ?\n\nBelle journée !\n${S.settings.company}`;
+}
+
+/* ---------- actions ---------- */
+Object.assign(ACT, {
+  receipt: d => receiptSheet(d.id),
+  receiptImg: async d => { const o = ord(d.id); toast('Création du reçu…'); const c = await receiptCanvas(o); imgSheet('Reçu en image · ' + o.no, [c], 'recu-' + o.no, receiptText(o), false); },
+  imgGo: async d => { const c = IMGS[+d.i]; const r = await deliver(await toBlob(c), d.base + (IMGS.length > 1 ? '-' + (+d.i + 1) : '') + '.png', 'image/png', window.__imgText); if (r === 'échec') toast('Enregistrement impossible : appuyez longuement sur l\'image', 'err'); else if (r !== 'annulé') toast('Image ' + r); },
+  pdfGo: async d => { const c = IMGS[+d.i]; const r = await deliver(pdfFromCanvas(c), d.base + (IMGS.length > 1 ? '-' + (+d.i + 1) : '') + '.pdf', 'application/pdf', ''); if (r === 'échec') toast('Enregistrement du PDF impossible', 'err'); else if (r !== 'annulé') toast('PDF ' + r); },
+  reportImg: async () => { toast('Création du rapport…'); const r = range(U.period); const c = await reportCanvas(r); imgSheet('Rapport en image / PDF', [c], 'rapport-skonciss-' + today(), reportText(), true); },
+  newLot: () => { newLot(); openSheet('Nouvel arrivage', lotForm); }, lot: d => sheetLot(d.id),
+  lotAdd: () => { const v = $('#lpick') && $('#lpick').value; if (!v) return toast('Choisissez un produit', 'err'); const p = prod(v); LD.lines.push({ pid: v, qty: '', buy: p.buy || '' }); drawSheet(); },
+  lotRm: d => { LD.lines.splice(+d.i, 1); drawSheet(); },
+  restockLot: () => { const R = restockList().filter(r => r.need > 0); newLot(R.map(r => ({ pid: r.p.id, qty: r.need, buy: r.p.buy || '' }))); openSheet('Nouvel arrivage', lotForm); },
+  restockCopy: () => { const t = ['Produits à recommander (' + fd(today()) + ')', ...restockList().filter(r => r.need > 0).map(r => '• ' + r.p.name + ' : ' + r.need + ' unités (stock ' + r.av + ', ' + r.q30 + ' vendus en 30 j)')].join('\n'); showText('Liste à recommander', t); },
+  catAll: d => { const all = S.products.filter(p => !p.archived && availOf(p) > 0); CATSEL = d.v === '1' ? new Set(all.map(p => p.id)) : new Set(); drawMain(); },
+  catText: () => { const ids = [...CATSEL]; if (!ids.length) return toast('Cochez au moins un produit', 'err'); msgSheet('Catalogue en texte', '', catalogText(ids), ''); },
+  catImg: async () => { const ids = [...CATSEL]; if (!ids.length) return toast('Cochez au moins un produit', 'err'); toast('Création du catalogue…'); const pages = await catPages(ids); imgSheet('Catalogue en image', pages, 'catalogue-skonciss', catalogText(ids), false); },
+  crmTab: d => { CRMTAB = d.v; drawMain(); },
+  crmMsg: d => { const c = S.customers.find(x => x.id === d.id), st = crmData().find(x => x.c.id === c.id); const kind = st && st.days >= S.settings.inactiveDays ? 'idle' : 'best';
+    msgSheet('Message à ' + c.name, c.phone, crmMessage(c, kind), `<div class="kv"><span>Client</span><b>${esc(c.name)}</b></div><div class="kv"><span>Téléphone</span><b>${esc(c.phone || 'non renseigné')}</b></div>${st ? `<div class="kv"><span>Achats livrés</span><b>${F(st.total)} · ${fdl(st.n, 'commande')}</b></div>` : ''}`); }
+});
+function sheetLot(id) {
+  openSheet('Arrivage', () => { const l = S.lots.find(x => x.id === id); return `<div class="row sp"><div><div style="font:800 22px var(--font-d)">${l.no}</div><div class="sub mut">${fd(l.date)}${l.supplier ? ' · ' + esc(l.supplier) : ''}</div></div></div>
+    <div class="card flat">${l.lines.map(x => `<div class="kv"><span>${esc(x.name)} × ${x.qty}<br><small>achat ${F(x.buy)} + frais ${F(x.impUnit)} / unité</small></span><b>${F(x.qty * (x.buy + x.impUnit))}</b></div>`).join('')}${kv('Transport international', F(l.transport))}${kv('Dédouanement', F(l.customs))}${kv('Autres frais', F(l.other))}${kv('Répartition', l.split === 'qty' ? 'selon les unités' : 'selon la valeur d\'achat')}${kv('Dépenses enregistrées', l.recorded ? 'oui' : 'non')}${l.note ? kv('Note', esc(l.note)) : ''}</div>`; });
+}
+FORMS.lot = G((f, el) => { const d = { ...LD, supplier: LD.supplier, date: LD.date }; A.receiveLot(d); toast('Arrivage enregistré · stock et coûts mis à jour'); closeSheet(); refresh(); });
+
+/* ---------- saisie ---------- */
+document.addEventListener('input', e => {
+  const t = e.target;
+  if (t.dataset.mm) { const a = $('#mm_go'); window.__txt = t.value; if (a) a.href = (waNum(t.dataset.phone) ? waLink(t.dataset.phone, t.value) : 'https://wa.me/?text=' + encodeURIComponent(t.value)); return; }
+  if (t.dataset.ld && LD) { LD[t.dataset.ld] = t.type === 'checkbox' ? t.checked : t.value; if (t.dataset.redraw) { const pos = t.selectionStart; drawSheet(); const n = $('#lq'); if (n) { n.focus(); n.setSelectionRange(pos, pos); } return; } const p = $('#lp'); if (p) p.innerHTML = lotPreview(); return; }
+  if (t.dataset.ll && LD) { const [i, k] = t.dataset.ll.split(':'); LD.lines[+i][k] = t.value; const p = $('#lp'); if (p) p.innerHTML = lotPreview(); }
+});
+document.addEventListener('change', e => { const t = e.target; if (t.dataset.cat && CATSEL) { t.checked ? CATSEL.add(t.dataset.cat) : CATSEL.delete(t.dataset.cat); } if (t.dataset.ld && LD && t.tagName === 'SELECT') { LD[t.dataset.ld] = t.value; const p = $('#lp'); if (p) p.innerHTML = lotPreview(); } });
+Object.assign(window.SK, { restockList, crmData, lotAlloc: A.lotAlloc, receiptText, catalogText, pdfFromCanvas, receiptCanvas, reportCanvas, catPages });
 
 </script></body></html>
