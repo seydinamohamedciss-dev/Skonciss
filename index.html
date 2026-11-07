@@ -238,10 +238,10 @@ const err = m => { throw new Error(m); };
 let S = null;
 const blank = () => ({
   v: VER, created: nowIso(), lastBackup: null,
-  settings: { company: 'SKONCISS AFRIKA', lateDays: 3, lowDefault: 5, soonDays: 7, debtDays: 7, cc: '221', phone: '', restockDays: 30, leadDays: 21, inactiveDays: 30, pin: null, salt: null },
+  settings: { company: 'SKONCISS AFRIKA', lateDays: 3, lowDefault: 5, soonDays: 7, debtDays: 7, cc: '221', phone: '', restockDays: 30, leadDays: 21, inactiveDays: 30, goalCA: 0, goalBrut: 0, pin: null, salt: null },
   cats: ['Sneakers','Vêtements','Accessoires','Électronique','Maison','Autres'],
   channels: ['TikTok Sneakers','TikTok Vêtements','TikTok Autres Produits','WhatsApp','Vente directe','Autre canal'].map((n,i) => ({ id: 'ch' + (i+1), name: n, active: true })),
-  products: [], moves: [], customers: [], orders: [], sales: [], expenses: [], debts: [], lots: [], log: [],
+  products: [], moves: [], customers: [], orders: [], sales: [], expenses: [], debts: [], lots: [], cash: { openDate: '', open: {}, entries: [] }, log: [],
   seq: { order: 0, sale: 0, sku: 0, lot: 0 }
 });
 
@@ -472,7 +472,7 @@ A.saveExpense = (id, d) => {
   const cat = EXP_CATS.find(c => c.n === d.cat) ? d.cat : err('Choisissez une catégorie.');
   if (!d.date) err('La date est obligatoire.');
   if (cat === 'Livraison' && d.orderId) err('Les frais de livraison d\'une commande se saisissent dans la fiche « Livraison » de la commande (pour ne pas les compter deux fois).');
-  const rec = { date: d.date, cat, amount, desc: (d.desc || '').trim(), method: d.method || 'Espèces', proof: d.proof || '', orderId: d.orderId || '', pid: d.pid || '', inc: !!d.inc };
+  const rec = { date: d.date, cat, amount, desc: (d.desc || '').trim(), method: d.method || 'Espèces', proof: d.proof || '', orderId: d.orderId || '', pid: d.pid || '', inc: !!d.inc, channel: d.channel || '' };
   if (id) { const e = S.expenses.find(x => x.id === id); if (e.void) err('Dépense annulée : non modifiable.'); const proof = d.proof === null || d.proof === undefined ? e.proof : d.proof; Object.assign(e, rec, { proof }); L('Dépense modifiée', cat, F(amount)); return e; }
   if (S.expenses.some(e => !e.void && e.date === rec.date && e.cat === cat && e.amount === amount && e.desc === rec.desc && Date.now() - e.ts < 15000)) err('Dépense identique enregistrée à l\'instant.');
   const e = { id: uid('e'), ts: Date.now(), ...rec, void: null }; S.expenses.push(e); L('Dépense créée', cat, F(amount)); return e;
@@ -656,7 +656,7 @@ const CSVS = {
     ['Frais livraison payés', o => o.delivery.fee], ['Notes', o => o.notes]])],
   creances: () => ['dettes-creances', csv(S.debts, [['Type', d => d.type === 'receivable' ? 'Créance client' : 'Dette entreprise'], ['Nom', d => d.name], ['Téléphone', d => d.phone], ['Motif', d => d.reason], ['Montant initial', d => dAmount(d)], ['Déjà payé', d => dPaid(d)], ['Solde restant', d => dBalance(d)], ['Créé le', d => fd(d.created)], ['Échéance', d => fd(d.due)], ['Statut', d => dStatus(d)], ['Commande', d => (dOrder(d) || {}).no || ''], ['Notes', d => d.notes]])],
   depenses: r => ['depenses', csv(S.expenses.filter(e => inR(e.date, r)), [['Date', e => fd(e.date)], ['Catégorie', e => e.cat], ['Montant', e => e.amount], ['Description', e => e.desc], ['Moyen', e => e.method],
-    ['Inclus dans coût de revient', e => e.inc ? 'oui' : 'non'], ['Commande', e => e.orderId ? (S.orders.find(o => o.id === e.orderId) || {}).no : ''], ['Produit', e => e.pid ? (prod(e.pid) || {}).name : ''], ['Annulée', e => e.void ? 'oui : ' + e.void.reason : 'non']])]
+    ['Boutique / compte', e => e.channel ? chName(e.channel) : ''], ['Inclus dans coût de revient', e => e.inc ? 'oui' : 'non'], ['Commande', e => e.orderId ? (S.orders.find(o => o.id === e.orderId) || {}).no : ''], ['Produit', e => e.pid ? (prod(e.pid) || {}).name : ''], ['Annulée', e => e.void ? 'oui : ' + e.void.reason : 'non']])]
 };
 
 /* ================= SAUVEGARDE LOCALE ================= */
@@ -758,7 +758,8 @@ const ICONS = {
 const I = n => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n].split(' M').map((d, i) => `<path d="${i ? 'M' : ''}${d}"/>`).join('')}</svg>`;
 
 const U = { tab: 'home', sub: null, q: '', cat: '', stockTab: 'all', ordTab: 'all', period: { key: 'month', from: '', to: '' }, sFilter: { ch: '', cat: '', pid: '' }, custQ: '', listFn: null, dTab: 'rec', dPer: 'all', dSt: 'all', dq: '' };
-const EXTRA_SCREENS = {}; let EXTRA_MENU = () => [];
+const EXTRA_SCREENS = {}; let EXTRA_MENU = () => []; let goalCard = () => '', backupBanner = () => '', syncCard = () => '', snapCard = () => '';
+let svBadge = () => ({ cls: storageOK ? '' : 'off', text: storageOK ? 'Local' : 'Non enregistré', title: storageOK ? 'Données enregistrées sur cet appareil' : 'Enregistrement impossible : exportez une sauvegarde' });
 const fdl = (n, w) => n + ' ' + w + (n > 1 ? 's' : '');
 
 /* ---------- petits composants ---------- */
@@ -804,7 +805,7 @@ const SUBT = { customers: 'Clients', expenses: 'Dépenses', deliveries: 'Livrais
 function drawTop() {
   $('#top').innerHTML = `<div class="top-in">${U.sub ? `<button class="icon-btn" data-act="back" aria-label="Retour">${I('back')}</button>` : `<div class="logo"><img src="${LOGO_SM}" alt="SKONCISS AFRIKA"></div>`}
   <div class="ttl"><small>${esc(S.settings.company)}</small><h1>${esc(U.sub ? SUBT[U.sub] : TITLES[U.tab])}</h1></div>
-  <div class="sv ${storageOK ? '' : 'off'}" title="${storageOK ? 'Données enregistrées sur cet appareil' : 'Enregistrement impossible : exportez une sauvegarde'}"><i></i>${storageOK ? 'Local' : 'Non enregistré'}</div></div>`;
+  ${(() => { const b = svBadge(); return `<div class="sv ${b.cls}" title="${esc(b.title)}"><i></i>${esc(b.text)}</div>`; })()}</div>`;
 }
 function badgeCount() { return S.orders.filter(o => o.status === 'Nouvelle commande').length; }
 function drawNav() {
@@ -880,6 +881,7 @@ function scHome() {
   <section class="hero"><small>Chiffre d'affaires · ${rangeLabel(r)}</small><div class="big">${F(m.ca).replace(' FCFA', '')}<span>FCFA</span></div>
     <div class="trio"><div><small>Bénéfice brut</small><b>${F(m.brut)}</b></div><div><small>Dépenses</small><b>${F(m.opex + m.delivPaid + m.losses)}</b></div><div><small>Résultat estimé</small><b>${F(m.result)}</b></div></div></section>
   ${warnCost}
+  ${backupBanner()}${goalCard()}
   ${installBanner()}
   ${alerts.length ? `<div class="stack">${alerts.join('')}</div>` : ''}
   <div class="tiles"><button class="tile" data-act="goDebts" data-tab="rec" data-st="all"><small>Clients me doivent</small><b>${F(dm.recBal)}</b><em>${dm.recLate ? dm.recLate + ' en retard' : 'à recevoir (pas encore encaissé)'}</em></button><button class="tile" data-act="goDebts" data-tab="pay" data-st="all"><small>Je dois payer</small><b>${F(dm.payBal)}</b><em>${dm.paySoon ? dm.paySoon + ' échéance(s) proche(s)' : 'dettes en cours'}</em></button></div>
@@ -1137,12 +1139,13 @@ function expenseForm(id) {
     <label class="row" style="gap:10px"><input type="checkbox" id="f_inc" name="inc" style="width:22px;height:22px" ${e.inc ? 'checked' : ''}><span>Déjà incluse dans le coût de revient des produits (alors non déduite du résultat)</span></label>
     ${fld('Description', 'desc', e.desc)}${sel('Moyen de paiement', 'method', METHODS, e.method)}
     ${sel('Commande associée (facultatif)', 'orderId', [['', '—'], ...S.orders.slice(-60).reverse().map(o => [o.id, o.no + ' · ' + o.name])], e.orderId)}
+    ${sel('Boutique / compte (utile pour la publicité)', 'channel', [['', '—'], ...chNames()], e.channel || '')}
     ${sel('Produit associé (facultatif)', 'pid', [['', '—'], ...S.products.map(p => [p.id, p.name])], e.pid)}
     <div class="row"><label class="btn s" style="cursor:pointer">Justificatif (photo)<input id="f_proof" type="file" accept="image/*" data-proof="1" hidden></label><span class="sub mut" id="proofst">${e.proof ? 'Justificatif enregistré' : ''}</span></div>
     <button class="btn p full">Enregistrer</button></form>`; });
 }
 function sheetExpense(id) {
-  openSheet('Dépense', () => { const e = S.expenses.find(x => x.id === id); return `<div class="card flat">${kv('Date', fd(e.date))}${kv('Catégorie', esc(e.cat))}${kv('Montant', F(e.amount), 'tot')}${kv('Description', esc(e.desc || '—'))}${kv('Moyen', esc(e.method))}${kv('Traitement', e.inc ? 'Inclus dans le coût de revient (non déduit)' : 'Déduit du résultat')}${e.orderId ? kv('Commande', esc((S.orders.find(o => o.id === e.orderId) || {}).no || '')) : ''}${e.pid ? kv('Produit', esc((prod(e.pid) || {}).name || '')) : ''}${e.void ? kv('Annulée', esc(e.void.reason) + ' · ' + fd(e.void.date)) : ''}</div>
+  openSheet('Dépense', () => { const e = S.expenses.find(x => x.id === id); return `<div class="card flat">${kv('Date', fd(e.date))}${kv('Catégorie', esc(e.cat))}${kv('Montant', F(e.amount), 'tot')}${kv('Description', esc(e.desc || '—'))}${kv('Moyen', esc(e.method))}${kv('Traitement', e.inc ? 'Inclus dans le coût de revient (non déduit)' : 'Déduit du résultat')}${e.orderId ? kv('Commande', esc((S.orders.find(o => o.id === e.orderId) || {}).no || '')) : ''}${e.pid ? kv('Produit', esc((prod(e.pid) || {}).name || '')) : ''}${e.channel ? kv('Boutique / compte', esc(chName(e.channel))) : ''}${e.void ? kv('Annulée', esc(e.void.reason) + ' · ' + fd(e.void.date)) : ''}</div>
   ${e.proof ? `<img src="${e.proof}" alt="Justificatif" style="border-radius:12px">` : ''}
   ${e.void ? '' : `<div class="btns"><button class="btn" data-act="editExpense" data-id="${id}">Modifier</button><button class="btn d" data-act="voidExpense" data-id="${id}">Annuler</button></div>`}`; });
 }
@@ -1197,9 +1200,9 @@ function reportText() { const r = range(U.period), m = metrics(r); return `${S.s
 /* ============ PARAMÈTRES ============ */
 function scSettings() {
   const days = S.lastBackup ? ft(S.lastBackup) : 'jamais';
-  return `${installCard()}<div class="card stack"><div class="sec-h"><h2>Sauvegarde et restauration</h2></div><p class="mut">Vos données sont enregistrées sur cet appareil. Dernière sauvegarde exportée : <b>${days}</b>. Exportez régulièrement un fichier de sauvegarde, surtout avant de vider les données du navigateur ou de changer de téléphone.</p>
+  return `${installCard()}${syncCard()}${snapCard()}<div class="card stack"><div class="sec-h"><h2>Sauvegarde et restauration</h2></div><p class="mut">Vos données sont enregistrées sur cet appareil. Dernière sauvegarde exportée : <b>${days}</b>. Exportez régulièrement un fichier de sauvegarde, surtout avant de vider les données du navigateur ou de changer de téléphone.</p>
   <div class="btns"><button class="btn p" data-act="backup">${I('download')} Exporter la sauvegarde</button><label class="btn" style="cursor:pointer">Restaurer<input id="f_restore" type="file" accept=".json,application/json" data-restore="1" hidden></label></div></div>
-  <form class="card stack" data-form="settings"><div class="sec-h"><h2>Entreprise</h2></div>${fld('Nom affiché', 'company', S.settings.company)}<div class="g2">${fld('Commande en retard après (jours)', 'lateDays', S.settings.lateDays, { num: 1 })}${fld('Seuil d\'alerte par défaut', 'lowDefault', S.settings.lowDefault, { num: 1 })}</div><div class="g2">${fld('Échéance par défaut des créances (jours)', 'debtDays', S.settings.debtDays, { num: 1 })}${fld('« Échéance proche » (jours)', 'soonDays', S.settings.soonDays, { num: 1 })}</div>${fld('Indicatif pays pour WhatsApp', 'cc', S.settings.cc, { num: 1, hint: '221 pour le Sénégal' })}${fld('Téléphone de l\'entreprise (reçus et catalogue)', 'phone', S.settings.phone, { attrs: 'inputmode="tel"' })}<div class="g2">${fld('Délai d\'arrivage (jours)', 'leadDays', S.settings.leadDays, { num: 1 })}${fld('Couverture souhaitée (jours)', 'restockDays', S.settings.restockDays, { num: 1 })}</div>${fld('Client inactif après (jours)', 'inactiveDays', S.settings.inactiveDays, { num: 1 })}<button class="btn p">Enregistrer</button></form>
+  <form class="card stack" data-form="settings"><div class="sec-h"><h2>Entreprise</h2></div>${fld('Nom affiché', 'company', S.settings.company)}<div class="g2">${fld('Commande en retard après (jours)', 'lateDays', S.settings.lateDays, { num: 1 })}${fld('Seuil d\'alerte par défaut', 'lowDefault', S.settings.lowDefault, { num: 1 })}</div><div class="g2">${fld('Échéance par défaut des créances (jours)', 'debtDays', S.settings.debtDays, { num: 1 })}${fld('« Échéance proche » (jours)', 'soonDays', S.settings.soonDays, { num: 1 })}</div>${fld('Indicatif pays pour WhatsApp', 'cc', S.settings.cc, { num: 1, hint: '221 pour le Sénégal' })}${fld('Téléphone de l\'entreprise (reçus et catalogue)', 'phone', S.settings.phone, { attrs: 'inputmode="tel"' })}<div class="g2">${fld('Délai d\'arrivage (jours)', 'leadDays', S.settings.leadDays, { num: 1 })}${fld('Couverture souhaitée (jours)', 'restockDays', S.settings.restockDays, { num: 1 })}</div>${fld('Client inactif après (jours)', 'inactiveDays', S.settings.inactiveDays, { num: 1 })}<div class="g2">${fld('Objectif de chiffre d\'affaires du mois', 'goalCA', S.settings.goalCA || '', { num: 1 })}${fld('Objectif de bénéfice brut du mois', 'goalBrut', S.settings.goalBrut || '', { num: 1 })}</div><button class="btn p">Enregistrer</button></form>
   <div class="card stack"><div class="sec-h"><h2>Code d'accès</h2>${S.settings.pin ? pill('Activé', 'good') : pill('Désactivé')}</div><p class="mut">Un code à 4 chiffres protège l'ouverture de l'application sur cet appareil. Ce n'est pas un compte en ligne : il ne remplace pas la protection du téléphone.</p>
   <div class="btns"><button class="btn" data-act="setPin">${S.settings.pin ? 'Changer le code' : 'Définir un code'}</button>${S.settings.pin ? `<button class="btn d" data-act="rmPin">Retirer le code</button>` : ''}</div></div>
   <div class="card stack"><div class="sec-h"><h2>Contrôle de cohérence</h2></div><p class="mut">Vérifie que le stock correspond aux mouvements et qu'aucune commande n'a deux ventes.</p><button class="btn" data-act="check">Lancer le contrôle</button></div>
@@ -1458,7 +1461,7 @@ const FORMS = {
   paydebt: (f, el) => { try { const x = S.debts.find(y => y.id === el.dataset.id), a = num(f.get('amount')); if (a <= 0) throw new Error('Le montant doit être supérieur à 0.'); if (a > dBalance(x)) throw new Error('Le montant dépasse le solde restant (' + F(dBalance(x)) + ').');
     const d = Object.fromEntries(f.entries()); const rec = x.type === 'receivable';
     ask(rec ? 'Confirmer le paiement ?' : 'Confirmer le remboursement ?', `${F(a)} ${rec ? 'reçus de' : 'remboursés à'} <b>${esc(x.name)}</b> (${esc(d.method)}). Solde après opération : <b>${F(dBalance(x) - a)}</b>.`, 'Confirmer', G(() => { A.payDebt(x.id, d); toast(rec ? 'Paiement enregistré' : 'Remboursement enregistré'); closeSheet(); refresh(); })); } catch (e) { toast(e.message, 'err'); } },
-  settings: G(f => { const lateDays = num(f.get('lateDays')), low = num(f.get('lowDefault')); if (lateDays < 1 || low < 0) throw new Error('Valeurs invalides.'); const dd = num(f.get('debtDays')), sd = num(f.get('soonDays')), cc = digits(f.get('cc')); if (dd < 0 || sd < 0 || !cc) throw new Error('Valeurs invalides.'); Object.assign(S.settings, { company: (f.get('company') || '').trim() || 'SKONCISS AFRIKA', lateDays, lowDefault: low, debtDays: dd, soonDays: sd, cc, phone: (f.get('phone') || '').trim(), leadDays: Math.max(0, num(f.get('leadDays'))), restockDays: Math.max(1, num(f.get('restockDays'))), inactiveDays: Math.max(1, num(f.get('inactiveDays'))) }); L('Paramètres modifiés'); toast('Paramètres enregistrés'); refresh(); }),
+  settings: G(f => { const lateDays = num(f.get('lateDays')), low = num(f.get('lowDefault')); if (lateDays < 1 || low < 0) throw new Error('Valeurs invalides.'); const dd = num(f.get('debtDays')), sd = num(f.get('soonDays')), cc = digits(f.get('cc')); if (dd < 0 || sd < 0 || !cc) throw new Error('Valeurs invalides.'); Object.assign(S.settings, { company: (f.get('company') || '').trim() || 'SKONCISS AFRIKA', lateDays, lowDefault: low, debtDays: dd, soonDays: sd, cc, phone: (f.get('phone') || '').trim(), leadDays: Math.max(0, num(f.get('leadDays'))), restockDays: Math.max(1, num(f.get('restockDays'))), inactiveDays: Math.max(1, num(f.get('inactiveDays'))), goalCA: Math.max(0, num(f.get('goalCA'))), goalBrut: Math.max(0, num(f.get('goalBrut'))) }); L('Paramètres modifiés'); toast('Paramètres enregistrés'); refresh(); }),
   pin: async f => { try { const pin = f.get('pin'); if (!/^\d{4}$/.test(pin)) throw new Error('Le code doit contenir 4 chiffres.'); const salt = uid('s'); S.settings.salt = salt; S.settings.pin = await sha(pin, salt); L('Code d\'accès défini'); toast('Code enregistré'); closeSheet(); refresh(); } catch (e) { toast(e.message, 'err'); } },
   unlock: async (f) => { const p = f.get('pin'); const ok = (await sha(p, S.settings.salt)) === S.settings.pin; if (ok) { $('#lock').classList.remove('on'); $('#lock').innerHTML = ''; } else { $('#lerr').textContent = 'Code incorrect'; $('#pin').value = ''; } },
   dlg: () => {}
@@ -1471,7 +1474,7 @@ async function boot() {
   await loadState(); try { A.syncDebts(); } catch (e) { console.error(e); } try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   refresh(); if (S.settings.pin) showLock();
   const t = $('#toast'); if (!storageOK) toast('Enregistrement impossible sur cet appareil', 'err');
-  initSW();
+  initSW(); if (typeof afterBoot === 'function') afterBoot();
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
 }
 boot();
@@ -1689,5 +1692,232 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('change', e => { const t = e.target; if (t.dataset.cat && CATSEL) { t.checked ? CATSEL.add(t.dataset.cat) : CATSEL.delete(t.dataset.cat); } if (t.dataset.ld && LD && t.tagName === 'SELECT') { LD[t.dataset.ld] = t.value; const p = $('#lp'); if (p) p.innerHTML = lotPreview(); } });
 Object.assign(window.SK, { restockList, crmData, lotAlloc: A.lotAlloc, receiptText, catalogText, pdfFromCanvas, receiptCanvas, reportCanvas, catPages });
+
+
+/* ============ Synchronisation en ligne, copies automatiques, caisse, objectifs, bilans, comparaison des comptes ============ */
+Object.assign(SUBT, { cash: 'Caisse', prodstats: 'Bilan par produit', compare: 'Comparer les comptes' });
+{ const prev = EXTRA_MENU; EXTRA_MENU = () => [...prev(), ['cash', 'wallet', 'Caisse', 'Argent réellement disponible'], ['prodstats', 'chart', 'Bilan par produit', 'Marge, retours, stock dormant'], ['compare', 'store', 'Comparer les comptes', 'Ventes, publicité, coût par vente']]; }
+
+/* ======================= COPIES AUTOMATIQUES (sur l'appareil) ======================= */
+const idbKV = {
+  async db() { return idb.open(); },
+  async put(k, v) { const db = await idb.open(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
+  async get(k) { const db = await idb.open(); return new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); },
+  async del(k) { const db = await idb.open(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').delete(k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
+  async keys() { const db = await idb.open(); return new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').getAllKeys(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); }
+};
+const hasData = (d = S) => !!(d.products.length || d.orders.length || d.debts.length || d.expenses.length);
+async function snapshot(label) {
+  if (!hasData()) return; const key = 'snap|' + nowIso() + '|' + label;
+  try { await idbKV.put(key, JSON.stringify(S)); const ks = (await idbKV.keys()).filter(k => String(k).startsWith('snap|')).sort(); for (const k of ks.slice(0, Math.max(0, ks.length - 12))) await idbKV.del(k); } catch (e) { console.error(e); }
+}
+async function dailySnapshot() { try { const ks = (await idbKV.keys()).filter(k => String(k).startsWith('snap|')); if (!ks.some(k => k.split('|')[1].slice(0, 10) === today() && k.endsWith('|auto'))) await snapshot('auto'); } catch (e) {} }
+snapCard = () => `<div class="card stack"><div class="sec-h"><h2>Copies automatiques</h2></div><p class="mut">L'application garde une copie par jour sur cet appareil (les 12 dernières). Elle vous protège d'une erreur de saisie ou d'une mauvaise restauration. Elle ne remplace pas la sauvegarde exportée : si les données du navigateur sont effacées, ces copies le sont aussi.</p><button class="btn" data-act="snaps">Voir les copies</button></div>`;
+ACT.snaps = async () => {
+  const ks = (await idbKV.keys()).filter(k => String(k).startsWith('snap|')).sort().reverse(); const items = [];
+  for (const k of ks) { try { const d = JSON.parse(await idbKV.get(k)); items.push({ k, d }); } catch (e) {} }
+  openSheet('Copies automatiques', () => items.length ? items.map((x, i) => { const [, date, lab] = x.k.split('|'); return `<div class="card flat"><div class="row sp wrapx"><b>${ft(date)}</b>${pill({ auto: 'Quotidienne', 'avant-sync': 'Avant synchronisation', 'avant-restauration': 'Avant restauration' }[lab] || lab)}</div><div class="sub mut">${x.d.products.length} produit(s) · ${x.d.orders.length} commande(s) · ${x.d.sales.length} vente(s) · ${x.d.expenses.length} dépense(s)</div><button class="btn s" style="margin-top:8px" data-act="snapRestore" data-i="${i}">Restaurer cette copie</button></div>`; }).join('') : empty('Aucune copie', 'La première copie est créée à l\'ouverture, dès que vous avez des données.'));
+  window.__snaps = items;
+};
+ACT.snapRestore = d => { const x = window.__snaps[+d.i]; ask('Restaurer cette copie ?', `Les données actuelles seront remplacées par celles du ${ft(x.k.split('|')[1])}. Une copie des données actuelles est faite avant.`, 'Restaurer', G(async () => { await snapshot('avant-restauration'); S = migrate(x.d); L('Copie automatique restaurée', ft(x.k.split('|')[1])); sheets.length = 0; toast('Copie restaurée'); refresh(); }), { danger: true }); };
+backupBanner = () => { if (!hasData()) return ''; const days = S.lastBackup ? Math.floor((Date.now() - Date.parse(S.lastBackup)) / 86400000) : null; if (days !== null && days <= 7) return '';
+  return `<div class="alert warn" style="align-items:center">${I('download')}<span>${days === null ? 'Aucune sauvegarde exportée.' : 'Dernière sauvegarde il y a ' + days + ' jours.'} Exportez-en une maintenant.</span><button class="btn p s" data-act="backup">Exporter</button></div>`; };
+
+/* ======================= SYNCHRONISATION SUPABASE ======================= */
+const SYNC_KEY = 'skonciss_sync_v1', SYNC_SQL = `create table if not exists public.skonciss_state (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  data jsonb not null,
+  version bigint not null default 1,
+  updated_at timestamptz not null default now()
+);
+alter table public.skonciss_state enable row level security;
+create policy "lecture de ses donnees" on public.skonciss_state for select using (auth.uid() = user_id);
+create policy "creation de ses donnees" on public.skonciss_state for insert with check (auth.uid() = user_id);
+create policy "modification de ses donnees" on public.skonciss_state for update using (auth.uid() = user_id) with check (auth.uid() = user_id);`;
+let SY = (() => { try { return JSON.parse(localStorage.getItem(SYNC_KEY)) || {}; } catch (e) { return {}; } })();
+const SYS = { busy: false, err: '', state: SY.session ? 'pending' : 'off', applying: false }; let syncT = null;
+const syncSave = () => { try { localStorage.setItem(SYNC_KEY, JSON.stringify(SY)); } catch (e) {} };
+const syncOn = () => !!(SY.url && SY.key && SY.session);
+const canSyncHere = () => isPwaBuild() && /^https?:$/.test(location.protocol);
+function jwtRole(k) { try { return JSON.parse(atob(k.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).role; } catch (e) { return ''; } }
+async function sbFetch(path, opt = {}, auth = true) {
+  const h = { apikey: SY.key, 'Content-Type': 'application/json', ...(opt.headers || {}) }; if (auth && SY.session) h.Authorization = 'Bearer ' + SY.session.access;
+  const r = await fetch(SY.url.replace(/\/+$/, '') + path, { ...opt, headers: h }); let j = null; try { j = await r.json(); } catch (e) {}
+  if (!r.ok) { const er = new Error((j && (j.msg || j.message || j.error_description || j.error)) || 'Erreur ' + r.status); er.status = r.status; er.code = j && j.code; throw er; } return j;
+}
+function setSession(j) { SY.session = { access: j.access_token, refresh: j.refresh_token, exp: Date.now() + (j.expires_in || 3600) * 1000 - 60000, uid: j.user.id, email: j.user.email }; syncSave(); }
+async function sbLogin(mode, email, password) {
+  const j = await sbFetch(mode === 'signup' ? '/auth/v1/signup' : '/auth/v1/token?grant_type=password', { method: 'POST', body: JSON.stringify({ email, password }) }, false);
+  if (!j.access_token) throw new Error('Compte créé. Confirmez votre e-mail (message reçu), puis connectez-vous.'); setSession(j);
+}
+async function ensureSession() { if (!SY.session) throw new Error('Non connecté.'); if (Date.now() > SY.session.exp) { const j = await sbFetch('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: JSON.stringify({ refresh_token: SY.session.refresh }) }, false); setSession(j); } }
+const sbPull = async () => (await sbFetch('/rest/v1/skonciss_state?select=data,version,updated_at&user_id=eq.' + SY.session.uid))[0] || null;
+async function sbPush(expectVer, force) {
+  const body = { data: JSON.parse(JSON.stringify(S)), updated_at: nowIso() };
+  if (expectVer == null) { try { const r = await sbFetch('/rest/v1/skonciss_state', { method: 'POST', headers: { Prefer: 'return=representation' }, body: JSON.stringify({ user_id: SY.session.uid, version: 1, ...body }) }); return r && r[0] ? r[0].version : null; } catch (e) { if (e.status === 409) return null; throw e; } }
+  const r = await sbFetch('/rest/v1/skonciss_state?user_id=eq.' + SY.session.uid + '&version=eq.' + expectVer, { method: 'PATCH', headers: { Prefer: 'return=representation' }, body: JSON.stringify({ ...body, version: expectVer + 1 }) });
+  return r && r[0] ? r[0].version : null;
+}
+function setSyncState(st, err) { SYS.state = st; SYS.err = err || ''; if (typeof drawTop === 'function') drawTop(); if (U.sub === 'settings' && !sheets.length) drawMain(); }
+async function applyRemote(remote) { SYS.applying = true; try { await snapshot('avant-sync'); S = migrate(JSON.parse(JSON.stringify(remote.data))); try { A.syncDebts(); } catch (e) {} SY.ver = remote.version; SY.dirty = false; SY.last = nowIso(); SY.conflict = null; syncSave(); lastJson = ''; refresh(); await flush(); } finally { SYS.applying = false; } }
+async function syncNow(manual) {
+  if (!canSyncHere() || !syncOn() || SYS.busy) return; if (!navigator.onLine) return setSyncState('offline');
+  SYS.busy = true; setSyncState('syncing');
+  try {
+    await ensureSession(); const remote = await sbPull();
+    if (!remote) { const v = await sbPush(null); if (v == null) throw new Error('Envoi impossible.'); SY.ver = v; SY.dirty = false; SY.last = nowIso(); syncSave(); setSyncState('ok'); }
+    else if (SY.ver == null) { if (!hasData()) { await applyRemote(remote); setSyncState('ok'); } else { SY.conflict = { remoteVer: remote.version, remoteDate: remote.updated_at, remote: remote.data && { p: remote.data.products.length, o: remote.data.orders.length, s: remote.data.sales.length } }; syncSave(); setSyncState('conflict'); if (manual) openConflict(); } }
+    else if (remote.version === SY.ver) { if (SY.dirty) { const v = await sbPush(SY.ver); if (v == null) { SY.conflict = { remoteVer: remote.version, remoteDate: remote.updated_at }; syncSave(); setSyncState('conflict'); } else { SY.ver = v; SY.dirty = false; SY.last = nowIso(); syncSave(); setSyncState('ok'); } } else { SY.last = nowIso(); syncSave(); setSyncState('ok'); } }
+    else { if (!SY.dirty) { await applyRemote(remote); setSyncState('ok'); toast('Données mises à jour depuis le serveur'); } else { SY.conflict = { remoteVer: remote.version, remoteDate: remote.updated_at, remote: remote.data && { p: remote.data.products.length, o: remote.data.orders.length, s: remote.data.sales.length } }; syncSave(); setSyncState('conflict'); if (manual) openConflict(); } }
+    if (manual && SYS.state === 'ok') toast('Synchronisé');
+  } catch (e) { setSyncState(e.status === 401 ? 'error' : (e instanceof TypeError ? 'offline' : 'error'), e.status === 401 ? 'Session expirée : reconnectez-vous.' : (e instanceof TypeError ? 'Connexion impossible' : e.message)); if (manual) toast(SYS.err || 'Synchronisation impossible', 'err'); }
+  finally { SYS.busy = false; }
+}
+const markDirty = () => { if (!syncOn() || SYS.applying) return; SY.dirty = true; syncSave(); if (SYS.state !== 'conflict') setSyncState('pending'); clearTimeout(syncT); syncT = setTimeout(() => { if (SY.conflict) return; syncNow(false); }, 4000); };
+{ const _flush = flush; flush = async function () { const before = lastJson; await _flush(); if (before !== '' && lastJson !== before) markDirty(); }; }
+svBadge = () => {
+  if (!syncOn()) return { cls: storageOK ? '' : 'off', text: storageOK ? 'Local' : 'Non enregistré', title: storageOK ? 'Données enregistrées sur cet appareil' : 'Enregistrement impossible : exportez une sauvegarde' };
+  const m = { ok: ['', 'Synchronisé', 'Données synchronisées' + (SY.last ? ' le ' + ft(SY.last) : '')], pending: ['', 'À synchroniser', 'Modifications en attente d\'envoi'], syncing: ['', 'Synchro…', 'Synchronisation en cours'], offline: ['off', 'Hors ligne', 'Les modifications seront envoyées au retour de la connexion'], conflict: ['off', 'Conflit', 'Les données diffèrent : choisissez la version à garder'], error: ['off', 'Erreur de synchro', SYS.err] }[SYS.state] || ['', 'Local', ''];
+  return { cls: m[0], text: m[1], title: m[2] };
+};
+syncCard = () => {
+  let body;
+  if (!canSyncHere()) body = `<p class="mut">La synchronisation fonctionne dans la version installée (hébergée en https), pas dans l'aperçu publié. Elle permet de retrouver vos données sur un autre téléphone.</p>`;
+  else if (!syncOn()) body = `<p class="mut">Retrouvez vos données sur plusieurs appareils et protégez-les en cas de perte du téléphone. Il faut un compte Supabase gratuit (voir les étapes dans le bouton ci-dessous).</p><button class="btn p full" data-act="syncSetup">Configurer la synchronisation</button>`;
+  else body = `<div class="row sp wrapx"><span>${esc(SY.session.email)}</span>${pill({ ok: 'Synchronisé', pending: 'À envoyer', syncing: 'En cours', offline: 'Hors ligne', conflict: 'Conflit', error: 'Erreur' }[SYS.state] || '…', { ok: 'good', conflict: 'bad', error: 'bad' }[SYS.state] || 'warn')}</div>
+    <p class="mut">${SY.last ? 'Dernière synchronisation : ' + ft(SY.last) : 'Pas encore synchronisé.'}${SYS.err ? '<br><b style="color:var(--bad)">' + esc(SYS.err) + '</b>' : ''}</p>
+    <div class="btns"><button class="btn p" data-act="syncNow">Synchroniser maintenant</button>${SY.conflict ? `<button class="btn d" data-act="syncConflict">Résoudre le conflit</button>` : `<button class="btn" data-act="syncSetup">Réglages</button>`}<button class="btn d full" data-act="syncOut">Se déconnecter</button></div>`;
+  return `<div class="card stack"><div class="sec-h"><h2>Synchronisation en ligne</h2></div>${body}</div>`;
+};
+function openConflict() {
+  const c = SY.conflict; if (!c) return;
+  openSheet('Les données diffèrent', () => `<div class="alert bad">${I('alert')}<span>Cet appareil et le serveur ont des données différentes. Rien n'a été écrasé.</span></div>
+    <div class="card flat">${kv('Cet appareil', S.products.length + ' produit(s) · ' + S.orders.length + ' commande(s) · ' + S.sales.length + ' vente(s)')}${kv('Serveur', c.remote ? c.remote.p + ' produit(s) · ' + c.remote.o + ' commande(s) · ' + c.remote.s + ' vente(s)' : 'version ' + c.remoteVer)}${c.remoteDate ? kv('Serveur modifié le', ft(c.remoteDate)) : ''}</div>
+    <p class="mut">Une copie de sécurité de cet appareil est faite avant tout remplacement. Il n'y a pas de fusion automatique : choisissez la version à conserver.</p>
+    <div class="btns"><button class="btn p full" data-act="keepLocal">Garder les données de cet appareil (remplace le serveur)</button><button class="btn d full" data-act="keepRemote">Récupérer les données du serveur (remplace cet appareil)</button></div>`);
+}
+Object.assign(ACT, {
+  syncSetup: () => openSheet('Synchronisation en ligne', () => `<div class="note">1) Créez un projet gratuit sur supabase.com. 2) Menu « SQL Editor » : collez le script ci-dessous et lancez-le. 3) « Project Settings » puis « API » : copiez l'adresse du projet et la clé <b>anon / publique</b> (jamais la clé « service_role »). 4) Collez-les ici, puis créez votre compte.</div>
+    <button class="btn" data-act="copySql">Copier le script SQL</button>
+    <form class="stack" data-form="syncLogin">${fld('Adresse du projet', 'url', SY.url || '', { req: 1, ph: 'https://xxxx.supabase.co', attrs: 'inputmode="url" autocapitalize="off"' })}${fld('Clé anon (publique)', 'key', SY.key || '', { req: 1, attrs: 'autocapitalize="off" autocomplete="off"' })}${fld('E-mail', 'email', SY.session ? SY.session.email : '', { type: 'email', req: 1 })}${fld('Mot de passe (8 caractères minimum)', 'password', '', { type: 'password', req: 1, attrs: 'autocomplete="current-password"' })}
+    <div class="btns"><button class="btn p" name="mode" value="login">Se connecter</button><button class="btn" name="mode" value="signup" formnovalidate>Créer le compte</button></div></form>
+    <div class="note">Le mot de passe n'est pas enregistré dans l'application. Les données sont protégées par des règles d'accès : chaque compte ne voit que les siennes.</div>`),
+  copySql: () => { window.__txt = SYNC_SQL; copyText(SYNC_SQL).catch(() => {}); showText('Script SQL à coller dans Supabase', SYNC_SQL); },
+  syncNow: () => syncNow(true), syncConflict: () => openConflict(),
+  syncOut: () => ask('Se déconnecter ?', 'Les données restent sur cet appareil. La synchronisation s\'arrête jusqu\'à la prochaine connexion.', 'Se déconnecter', G(() => { SY = { url: SY.url, key: SY.key }; syncSave(); SYS.state = 'off'; SYS.err = ''; toast('Déconnecté'); drawTop(); drawMain(); }), { danger: true }),
+  keepLocal: () => ask('Remplacer les données du serveur ?', 'Les données du serveur seront écrasées par celles de cet appareil.', 'Garder cet appareil', G(async () => { try { await ensureSession(); const r = await sbPull(); const v = await sbPush(r ? r.version : null, true); if (v == null) throw new Error('Le serveur a encore changé : relancez la synchronisation.'); await snapshot('avant-sync'); SY.ver = v; SY.dirty = false; SY.conflict = null; SY.last = nowIso(); syncSave(); setSyncState('ok'); sheets.length = 0; drawSheet(); toast('Serveur mis à jour'); } catch (e) { toast(e.message, 'err'); } }), { danger: true }),
+  keepRemote: () => ask('Remplacer cet appareil ?', 'Les données de cet appareil seront remplacées par celles du serveur (copie de sécurité faite avant).', 'Récupérer le serveur', G(async () => { try { await ensureSession(); const r = await sbPull(); if (!r) throw new Error('Rien sur le serveur.'); await applyRemote(r); setSyncState('ok'); sheets.length = 0; drawSheet(); toast('Données du serveur récupérées'); } catch (e) { toast(e.message, 'err'); } }), { danger: true })
+});
+FORMS.syncLogin = async (f, el) => {
+  const mode = (document.activeElement && document.activeElement.name === 'mode' ? document.activeElement.value : null) || (window.__syncMode || 'login');
+  const url = (f.get('url') || '').trim().replace(/\/+$/, ''), key = (f.get('key') || '').trim(), email = (f.get('email') || '').trim(), pw = f.get('password') || '';
+  try {
+    if (!/^https:\/\/[^\s/]+\.[^\s/]+$/.test(url) && !/^http:\/\/localhost/.test(url)) throw new Error('Adresse invalide : elle commence par https:// (ex. https://xxxx.supabase.co).');
+    if (jwtRole(key) === 'service_role') throw new Error('Cette clé est une clé privée (service_role). Utilisez la clé « anon » publique : la clé privée ne doit jamais être dans l\'application.');
+    if (key.length < 20) throw new Error('Clé invalide.'); if (pw.length < 8) throw new Error('Mot de passe : 8 caractères minimum.');
+    SY.url = url; SY.key = key; toast(mode === 'signup' ? 'Création du compte…' : 'Connexion…'); await sbLogin(mode, email, pw); SY.ver = null; SY.dirty = false; syncSave(); sheets.length = 0; drawSheet(); setSyncState('pending'); await syncNow(true); drawMain();
+  } catch (e) { toast(e instanceof TypeError ? 'Connexion impossible : vérifiez l\'adresse et Internet.' : e.message, 'err'); }
+};
+document.addEventListener('click', e => { const b = e.target.closest('button[name=mode]'); if (b) window.__syncMode = b.value; }, true);
+addEventListener('online', () => { if (syncOn() && SY.dirty) syncNow(false); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && syncOn() && !SYS.busy) syncNow(false); });
+function afterBoot() { setTimeout(() => { dailySnapshot(); if (syncOn() && canSyncHere()) syncNow(false); }, 1200); }
+
+/* ======================= CAISSE ======================= */
+const ACCTS = ['Espèces', 'Wave', 'Orange Money', 'Virement bancaire', 'Autre moyen'];
+const acctOf = m => m === 'Paiement à la livraison' ? 'Espèces' : ACCTS.includes(m) ? m : 'Autre moyen';
+function cashMoves() {
+  const od = S.cash.openDate || '0000-00-00', out = [];
+  for (const o of S.orders) { for (const p of o.payments) if (!p.void) out.push({ date: p.date, acct: acctOf(p.method), amt: p.amount, label: (p.amount < 0 ? 'Remboursement ' : 'Encaissement ') + o.no, src: 'auto' });
+    if (o.delivery.fee > 0) out.push({ date: o.delivery.shipDate || o.date.slice(0, 10), acct: 'Espèces', amt: -o.delivery.fee, label: 'Livraison ' + o.no + ' (supposée payée en espèces)', src: 'auto' }); }
+  for (const d of S.debts) if (!d.orderId) for (const p of d.payments) if (!p.void) out.push({ date: p.date, acct: acctOf(p.method), amt: d.type === 'receivable' ? p.amount : -p.amount, label: (d.type === 'receivable' ? 'Créance reçue : ' : 'Dette remboursée : ') + d.name, src: 'auto' });
+  for (const e of S.expenses) if (!e.void) out.push({ date: e.date, acct: acctOf(e.method), amt: -e.amount, label: e.cat + (e.desc ? ' · ' + e.desc : ''), src: 'auto' });
+  for (const m of S.cash.entries) if (!m.void) { if (m.type === 'in') out.push({ date: m.date, acct: m.to, amt: m.amount, label: 'Apport · ' + (m.note || ''), src: 'manual', id: m.id }); else if (m.type === 'out') out.push({ date: m.date, acct: m.from, amt: -m.amount, label: 'Retrait · ' + (m.note || ''), src: 'manual', id: m.id }); else { out.push({ date: m.date, acct: m.from, amt: -m.amount, label: 'Transfert vers ' + m.to, src: 'manual', id: m.id }); out.push({ date: m.date, acct: m.to, amt: m.amount, label: 'Transfert depuis ' + m.from, src: 'manual', id: m.id, dup: 1 }); } }
+  return out.filter(x => x.date >= od);
+}
+function cashBalances() { const b = {}; ACCTS.forEach(a => b[a] = num(S.cash.open[a])); cashMoves().forEach(m => b[m.acct] += m.amt); return b; }
+A.cashEntry = d => {
+  const amount = num(d.amount); if (amount <= 0) err('Le montant doit être supérieur à 0.'); const type = d.type;
+  if (!['in', 'out', 'transfer'].includes(type)) err('Type inconnu.'); if (!d.date) err('La date est obligatoire.');
+  if (type === 'transfer' && d.from === d.to) err('Choisissez deux comptes différents.');
+  if (S.cash.entries.some(x => !x.void && x.type === type && x.amount === amount && x.date === d.date && x.from === (d.from || '') && x.to === (d.to || '') && Date.now() - x.ts < 15000)) err('Mouvement identique enregistré à l\'instant.');
+  const e = { id: uid('cm'), ts: Date.now(), type, date: d.date, amount, from: type === 'in' ? '' : d.from, to: type === 'out' ? '' : d.to, note: (d.note || '').trim(), void: null }; S.cash.entries.push(e); L('Mouvement de caisse', type, F(amount) + ' ' + (e.note || '')); return e;
+};
+A.voidCash = (id, reason) => { const e = S.cash.entries.find(x => x.id === id) || err('Introuvable.'); if (!(reason || '').trim()) err('Indiquez le motif.'); e.void = { date: nowIso(), reason: reason.trim() }; L('Mouvement de caisse annulé', e.type, reason.trim()); };
+A.cashOpening = d => { const open = {}; for (const a of ACCTS) { const v = num(d['o_' + a]); if (v < 0) err('Solde négatif impossible.'); open[a] = v; } S.cash.open = open; S.cash.openDate = d.date || today(); L('Soldes de départ de la caisse', S.cash.openDate, F(sum(Object.values(open), x => x))); };
+EXTRA_SCREENS.cash = () => {
+  const b = cashBalances(), total = sum(Object.values(b), x => x), dm = debtMetrics(), mv = cashMoves().sort((a, c) => c.date.localeCompare(a.date)).slice(0, 40);
+  return `<div class="note">${S.cash.openDate ? 'Soldes calculés à partir du ' + fd(S.cash.openDate) + '.' : 'Soldes de départ non définis : les chiffres partent de zéro. Touchez « Soldes de départ » pour y mettre l\'argent que vous avez aujourd\'hui.'} Les encaissements, dépenses, créances et dettes enregistrés alimentent la caisse automatiquement.</div>
+  <section class="hero"><small>Argent réellement disponible</small><div class="big">${F(total).replace(' FCFA', '')}<span>FCFA</span></div><div class="trio"><div><small>+ À recevoir</small><b>${F(dm.recBal)}</b></div><div><small>− À payer</small><b>${F(dm.payBal)}</b></div><div><small>Position nette</small><b>${F(total + dm.recBal - dm.payBal)}</b></div></div></section>
+  <div class="tiles">${ACCTS.map(a => `<div class="tile ${b[a] < 0 ? 'bad' : ''}"><small>${a}</small><b>${F(b[a])}</b></div>`).join('')}</div>
+  <div class="btns"><button class="btn p" data-act="cashNew" data-t="transfer">Transfert entre comptes</button><button class="btn" data-act="cashNew" data-t="in">Apport d'argent</button><button class="btn" data-act="cashNew" data-t="out">Retrait personnel</button><button class="btn" data-act="cashOpen">Soldes de départ</button></div>
+  <div class="sec-h"><h2>Derniers mouvements</h2></div>
+  <div class="list">${mv.length ? mv.map(m => `<${m.src === 'manual' && !m.dup ? 'button' : 'div'} class="item" ${m.src === 'manual' && !m.dup ? `data-act="cashVoid" data-id="${m.id}"` : 'style="cursor:default"'}><div class="grow"><div class="nm" style="font-weight:600">${esc(m.label)}</div><div class="sub">${fd(m.date)} · ${esc(m.acct)}${m.src === 'manual' ? ' · saisi à la main' : ''}</div></div><div class="amt" style="color:${m.amt < 0 ? 'var(--bad)' : 'var(--good)'}">${m.amt < 0 ? '− ' : '+ '}${F(Math.abs(m.amt))}</div></${m.src === 'manual' && !m.dup ? 'button' : 'div'}>`).join('') : empty('Aucun mouvement', 'Les paiements et dépenses apparaîtront ici.')}</div>
+  <div class="note">Les frais de livraison saisis sur une commande sont comptés en espèces. Un achat de marchandises enregistré par arrivage sort de la caisse à sa date.</div>`;
+};
+Object.assign(ACT, {
+  cashNew: d => openSheet({ transfer: 'Transfert entre comptes', in: 'Apport d\'argent', out: 'Retrait personnel' }[d.t], () => `<form class="stack" data-form="cash" data-t="${d.t}">${d.t !== 'in' ? sel(d.t === 'out' ? 'Retiré du compte' : 'Depuis', 'from', ACCTS, 'Wave') : ''}${d.t !== 'out' ? sel(d.t === 'in' ? 'Versé sur le compte' : 'Vers', 'to', ACCTS, 'Espèces') : ''}${fld('Montant (FCFA)', 'amount', '', { num: 1, req: 1 })}${fld('Date', 'date', today(), { type: 'date', req: 1 })}${fld('Note', 'note', '', { ph: d.t === 'transfer' ? 'Ex. : retrait Wave' : '' })}<button class="btn p full">Enregistrer</button></form>`),
+  cashVoid: d => ask('Annuler ce mouvement ?', 'Il reste visible dans le journal mais n\'est plus compté.', 'Annuler le mouvement', G(v => { A.voidCash(d.id, v); toast('Mouvement annulé'); refresh(); }), { danger: true, input: 'Motif', req: 1 }),
+  cashOpen: () => openSheet('Soldes de départ', () => `<form class="stack" data-form="cashopen"><div class="note">Indiquez l'argent que vous avez maintenant sur chaque compte. Seuls les mouvements à partir de cette date comptent ensuite.</div>${fld('À la date du', 'date', S.cash.openDate || today(), { type: 'date', req: 1 })}${ACCTS.map(a => fld(a, 'o_' + a, S.cash.open[a] || '', { num: 1 })).join('')}<button class="btn p full">Enregistrer</button></form>`)
+});
+FORMS.cash = G((f, el) => { const d = Object.fromEntries(f.entries()); d.type = el.dataset.t; A.cashEntry(d); toast('Mouvement enregistré'); closeSheet(); refresh(); });
+FORMS.cashopen = G(f => { A.cashOpening(Object.fromEntries(f.entries())); toast('Soldes enregistrés'); closeSheet(); refresh(); });
+
+/* ======================= OBJECTIFS ======================= */
+goalCard = () => {
+  const g = S.settings.goalCA, gb = S.settings.goalBrut; if (!g && !gb) return '';
+  const t = today(), m = metrics(range({ key: 'month' })), day = +t.slice(8), dim = new Date(Date.UTC(+t.slice(0, 4), +t.slice(5, 7), 0)).getUTCDate(), pace = day / dim;
+  const bar = (label, val, goal) => { const pct = Math.min(100, Math.round(val / goal * 100)), exp = goal * pace, diff = val - exp;
+    return `<div><div class="l" style="display:flex;justify-content:space-between;gap:8px"><span>${label}</span><b>${F(val)} / ${F(goal)}</b></div><div class="t" style="height:10px;border-radius:5px;background:var(--neutral-bg);margin-top:5px;position:relative;overflow:hidden"><i style="display:block;height:100%;width:${Math.max(2, pct)}%;background:var(--brand)"></i><u style="position:absolute;top:0;bottom:0;left:${Math.round(pace * 100)}%;width:2px;background:var(--ink)"></u></div><div class="mut" style="font-size:12.5px;margin-top:4px">${pct} % de l'objectif · ${diff >= 0 ? 'en avance de ' + F(diff) : 'en retard de ' + F(-diff)} sur le rythme du mois (jour ${day}/${dim})</div></div>`; };
+  return `<div class="card stack"><div class="sec-h"><h2>Objectifs du mois</h2><small>repère noir = rythme attendu</small></div>${g ? bar('Chiffre d\'affaires', m.ca, g) : ''}${gb ? bar('Bénéfice brut', m.brut, gb) : ''}</div>`;
+};
+
+/* ======================= BILAN PAR PRODUIT ======================= */
+let PS_SORT = 'margin';
+function prodStats() {
+  const t = today(), sales = S.sales.filter(s => !s.returned), rows = [];
+  for (const p of S.products) {
+    const bought = sum(S.moves.filter(m => m.pid === p.id && m.dq > 0 && (m.type === 'initial' || m.type === 'entree')), m => m.dq);
+    let sold = 0, rev = 0, cogs = 0, last = ''; for (const s of sales) for (const i of s.items) if (i.pid === p.id) { sold += i.qty; rev += i.qty * i.price; cogs += i.qty * i.cost; if (s.date.slice(0, 10) > last) last = s.date.slice(0, 10); }
+    let retQty = 0, lost = 0; for (const o of S.orders) if (o.returnInfo) for (const l of o.returnInfo.lines) if (l.pid === p.id) { retQty += l.qty; lost += l.qty - l.resell; }
+    const days = last ? Math.floor((Date.parse(t) - Date.parse(last)) / 86400000) : null, age = Math.floor((Date.parse(t) - Date.parse(p.added.slice(0, 10))) / 86400000);
+    rows.push({ p, bought, sold, rev, margin: rev - cogs, pct: rev ? (rev - cogs) / rev : 0, retQty, lost, cap: p.qty * costOf(p), days, st: bought ? sold / bought : 0, dormant: !p.archived && p.qty > 0 && age >= 30 && (days === null || days >= 30) });
+  }
+  return rows.filter(r => !r.p.archived || r.sold);
+}
+EXTRA_SCREENS.prodstats = () => {
+  const R = prodStats().sort((a, b) => PS_SORT === 'margin' ? b.margin - a.margin : PS_SORT === 'sold' ? b.sold - a.sold : b.cap - a.cap), chip = (v, l) => `<button class="chip ${PS_SORT === v ? 'on' : ''}" data-act="psSort" data-v="${v}">${l}</button>`;
+  if (!R.length) return empty('Aucun produit', 'Ajoutez des produits et des ventes pour voir le bilan.');
+  const dorm = R.filter(r => r.dormant), cap = sum(dorm, r => r.cap);
+  return `<div class="chips">${chip('margin', 'Marge')}${chip('sold', 'Quantités vendues')}${chip('cap', 'Capital immobilisé')}</div>
+  ${dorm.length ? `<div class="alert warn">${I('alert')}<span>${fdl(dorm.length, 'produit')} dormant${dorm.length > 1 ? 's' : ''} (en stock, sans vente depuis 30 j) : ${F(cap)} immobilisés</span></div>` : ''}
+  <div class="list">${R.map(r => `<div class="item" style="cursor:default;align-items:flex-start">${thumb(r.p)}<div class="grow"><div class="row sp wrapx"><div class="nm">${esc(r.p.name)}</div>${r.dormant ? pill('Dormant', 'warn') : r.p.qty <= 0 ? pill('Rupture', 'bad') : ''}</div>
+  <div class="sub">Achetés ${r.bought} · vendus ${r.sold} (${Math.round(r.st * 100)} %) · en stock ${r.p.qty}</div><div class="sub">Retours ${r.retQty}${r.lost ? ' dont ' + r.lost + ' perdu(s)' : ''} · ${r.days === null ? 'jamais vendu' : 'dernière vente il y a ' + r.days + ' j'}</div><div class="sub">Capital immobilisé ${F(r.cap)}</div></div><div class="amt">${F(r.margin)}<small>marge ${Math.round(r.pct * 100)} %</small></div></div>`).join('')}</div>
+  <div class="note">Marge réelle = ventes livrées − coût de revient au moment de la vente (hors ventes retournées).</div>`;
+};
+ACT.psSort = d => { PS_SORT = d.v; drawMain(); };
+
+/* ======================= COMPARER LES COMPTES (et publicité) ======================= */
+function channelStats(r) {
+  const m = metrics(r), rows = [];
+  const ads = ch => sum(S.expenses.filter(e => !e.void && !e.inc && e.cat === 'Publicité' && (e.channel || '') === ch && inR(e.date, r)), e => e.amount);
+  for (const c of S.channels) {
+    const ss = m.sales.filter(s => s.channel === c.id), ca = sum(ss, s => s.revenue), brut = ca - sum(ss, s => s.cogs), os = S.orders.filter(o => o.channel === c.id && inR(o.date, r));
+    const delivered = os.filter(o => o.saleId).length, ret = os.filter(o => ['Retour à traiter', 'Retournée'].includes(o.status)).length, canc = os.filter(o => o.status === 'Annulée').length, ad = ads(c.id);
+    if (!ss.length && !os.length && !ad) continue;
+    rows.push({ c, n: ss.length, ca, brut, panier: ss.length ? ca / ss.length : 0, orders: os.length, ret, retRate: delivered ? ret / delivered : 0, canc, ad, cps: ss.length ? ad / ss.length : 0, roas: ad ? ca / ad : 0, after: brut - ad });
+  }
+  const free = ads(''); return { rows: rows.sort((a, b) => b.after - a.after), free };
+}
+EXTRA_SCREENS.compare = () => {
+  const r = range(U.period), { rows, free } = channelStats(r), max = Math.max(1, ...rows.map(x => x.ca));
+  return `${periodBar()}<div class="note">Pour mesurer la publicité par compte, choisissez le compte dans la dépense de catégorie « Publicité ». Coût par vente = publicité ÷ nombre de ventes livrées. ROAS = chiffre d'affaires ÷ publicité.</div>
+  ${free ? `<div class="alert warn">${I('alert')}<span>${F(free)} de publicité non rattachée à un compte : elle n'est pas comptée ci-dessous.</span></div>` : ''}
+  ${rows.length ? rows.map((x, i) => `<div class="card stack"><div class="row sp wrapx"><div class="nm" style="font:700 17px var(--font-d)">${esc(x.c.name)}</div>${i === 0 && rows.length > 1 ? pill('Meilleur résultat', 'good') : ''}</div>
+  <div class="hb"><div><div class="l"><span>Chiffre d'affaires</span><b>${F(x.ca)}</b></div><div class="t"><i style="width:${Math.max(2, x.ca / max * 100)}%"></i></div></div></div>
+  ${kv('Ventes livrées', x.n)}${kv('Panier moyen', F(x.panier))}${kv('Bénéfice brut', F(x.brut))}${kv('Publicité', F(x.ad))}${x.ad ? kv('Coût par vente', x.n ? F(x.cps) : '—') + kv('ROAS', x.roas.toFixed(1) + ' ×') : ''}${kv('Bénéfice après publicité', F(x.after), 'tot')}${kv('Commandes / annulées / retours', x.orders + ' / ' + x.canc + ' / ' + x.ret + (x.n ? ' (' + Math.round(x.retRate * 100) + ' % de retours)' : ''))}</div>`).join('') : empty('Aucune donnée', 'Aucune vente ni publicité sur cette période.')}`;
+};
+
+Object.assign(window.SK, { cashBalances, cashMoves, prodStats, channelStats, goalCard, snapshot, hasData, syncNow, get SY() { return SY; }, SYS, SYNC_SQL, jwtRole, markDirty });
 
 </script></body></html>
